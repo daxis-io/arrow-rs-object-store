@@ -111,7 +111,7 @@ aws-base = ["cloud-base", "crc-fast", "dep:md-5"]
 azure = ["azure-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
 gcp = ["gcp-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
 aws = ["aws-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
-http = ["http-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
+http = ["cloud-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
 
 fs = ["dep:walkdir", "tokio", "dep:nix", "dep:windows-sys"]
 integration = ["rand", "tokio"]
