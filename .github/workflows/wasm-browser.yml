@@ -29,7 +29,7 @@ jobs:
     container:
       image: debian:bookworm-slim
     env:
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ci/compiler-free-linker.sh
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ${{ github.workspace }}/ci/compiler-free-linker.sh
     steps:
       - name: Install transport tools
         run: |
@@ -53,6 +53,6 @@ jobs:
             fi
           done
           command -v ld.lld
-          test -x ci/compiler-free-linker.sh
+          test -x "$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
       - name: Check browser graph
         run: tests/wasm-consumer/check-wasm-graph.sh
