@@ -29,12 +29,12 @@ jobs:
     container:
       image: debian:bookworm-slim
     env:
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ld.lld
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ci/compiler-free-linker.sh
     steps:
       - name: Install transport tools
         run: |
           apt-get update
-          apt-get install --yes --no-install-recommends ca-certificates curl git libc6-dev lld
+          apt-get install --yes --no-install-recommends ca-certificates curl git libc6-dev libgcc-12-dev lld
           rm -rf /var/lib/apt/lists/*
       - uses: actions/checkout@v6
       - name: Install Rust 1.85 and wasm32
@@ -53,5 +53,6 @@ jobs:
             fi
           done
           command -v ld.lld
+          test -x ci/compiler-free-linker.sh
       - name: Check browser graph
         run: tests/wasm-consumer/check-wasm-graph.sh
