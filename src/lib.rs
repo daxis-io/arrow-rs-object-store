@@ -699,10 +699,7 @@
 pub mod aws;
 #[cfg(feature = "azure-base")]
 pub mod azure;
-#[cfg(all(
-    feature = "tokio",
-    not(all(target_arch = "wasm32", target_os = "unknown"))
-))]
+#[cfg(feature = "tokio")]
 pub mod buffered;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod chunked;
