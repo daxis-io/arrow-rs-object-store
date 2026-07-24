@@ -114,7 +114,6 @@ aws = ["aws-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
 http = ["http-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
 
 fs = ["dep:walkdir", "tokio", "dep:nix", "dep:windows-sys"]
-tls-webpki-roots = ["reqwest?/rustls-tls-webpki-roots"]
 integration = ["rand", "tokio"]
 tokio = ["dep:tokio", "dep:tracing"]
 
