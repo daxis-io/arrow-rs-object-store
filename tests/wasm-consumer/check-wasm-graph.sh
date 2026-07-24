@@ -31,7 +31,7 @@ cargo check --locked --manifest-path "${manifest}" --target "${target}" \
 graph="$(cargo tree --locked --manifest-path "${manifest}" --target "${target}" \
   --no-default-features --features http --edges normal --prefix none)"
 
-denied='^(aws-lc-sys|hyper|hyper-util|liblzma-sys|native-tls|openssl-sys|ring|tempfile|tokio|walkdir|zstd-sys) v'
+denied='^(aws-lc-sys|hyper|hyper-util|liblzma-sys|native-tls|openssl-sys|ring|tempfile|walkdir|zstd-sys) v'
 if printf '%s\n' "${graph}" | grep -E "${denied}"; then
   echo "denied native dependency found in the browser graph" >&2
   exit 1
@@ -41,6 +41,10 @@ features="$(cargo tree --locked --manifest-path "${manifest}" --target "${target
   --no-default-features --features http --edges features --prefix none)"
 if printf '%s\n' "${features}" | grep -E '^object_store feature "(fs|aws|azure|gcp)"'; then
   echo "filesystem or cloud-provider batteries found in the browser graph" >&2
+  exit 1
+fi
+if printf '%s\n' "${features}" | grep -F 'tokio feature "rt-multi-thread"'; then
+  echo "Tokio multi-thread scheduling found in the browser graph" >&2
   exit 1
 fi
 
