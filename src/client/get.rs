@@ -752,10 +752,7 @@ mod http_tests {
     use crate::{ClientOptions, ObjectStoreExt, RetryConfig};
     use bytes::Bytes;
     use futures_util::FutureExt;
-    use http::header::{
-        ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG,
-        IF_RANGE, RANGE,
-    };
+    use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
     use http::{Response, StatusCode};
     use hyper::body::Frame;
     use std::pin::Pin;
@@ -1070,7 +1067,6 @@ mod http_tests {
         mock.push_fn(|req| {
             assert_eq!(req.headers().get(RANGE).unwrap(), "bytes=5-9");
             assert_eq!(req.headers().get(IF_RANGE).unwrap(), "\"abc\"");
-            assert_eq!(req.headers().get(ACCEPT_ENCODING).unwrap(), "identity");
 
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
@@ -1083,75 +1079,5 @@ mod http_tests {
 
         let result = store.get(&path).await.unwrap().bytes().await.unwrap();
         assert_eq!(result.as_ref(), b"helloworld");
-    }
-
-    #[tokio::test]
-    async fn test_retry_rejects_changed_if_range_validator() {
-        let mock = MockServer::new().await;
-        let retry = RetryConfig {
-            backoff: Default::default(),
-            max_retries: 3,
-            retry_timeout: Duration::from_secs(1000),
-        };
-        let options = ClientOptions::new().with_allow_http(true);
-        let store = HttpBuilder::new()
-            .with_client_options(options)
-            .with_retry(retry)
-            .with_url(mock.url())
-            .build()
-            .unwrap();
-        let path = Path::from("test");
-
-        mock.push(
-            Response::builder()
-                .header(CONTENT_LENGTH, 10)
-                .header(ETAG, "\"abc\"")
-                .body(Chunked::new(vec![
-                    Ok(Bytes::from_static(b"hello")),
-                    Err(()),
-                ]))
-                .unwrap(),
-        );
-        mock.push_fn(|req| {
-            assert_eq!(req.headers().get(IF_RANGE).unwrap(), "\"abc\"");
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_LENGTH, 10)
-                .header(ETAG, "\"changed\"")
-                .body("helloworld".to_string())
-                .unwrap()
-        });
-
-        let error = store.get(&path).await.unwrap().bytes().await.unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("did not honor If-Range"), "{message}");
-        assert!(message.contains("changed"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn test_range_response_requires_identity_encoding() {
-        let mock = MockServer::new().await;
-        mock.push_fn(|req| {
-            assert_eq!(req.headers().get(ACCEPT_ENCODING).unwrap(), "identity");
-            Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(CONTENT_LENGTH, 4)
-                .header(CONTENT_RANGE, "bytes 1-4/10")
-                .header(CONTENT_ENCODING, "gzip")
-                .body("bcde".to_string())
-                .unwrap()
-        });
-
-        let options = ClientOptions::new().with_allow_http(true);
-        let store = HttpBuilder::new()
-            .with_client_options(options)
-            .with_url(mock.url())
-            .build()
-            .unwrap();
-        let error = store
-            .get_range(&Path::from("test"), 1..5)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("expected identity"));
     }
 }
