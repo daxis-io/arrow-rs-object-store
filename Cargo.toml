@@ -33,17 +33,17 @@ all-features = true
 [dependencies] # In alphabetical order
 async-trait = "0.1.53"
 bytes = "1.0"
-chrono = { version = "0.4.34", default-features = false, features = ["clock"] }
+chrono = { version = "0.4.34", default-features = false, features = ["std", "now"] }
 futures-core = "0.3"
 futures-util = { version = "0.3", features = ["sink"] }
 http = "1.2.0"
+http-body = { version = "1.0", optional = true }
 humantime = "2.1"
 itertools = "0.15.0"
 parking_lot = { version = "0.12" }
 percent-encoding = "2.1"
 thiserror = "2.0.2"
 url = "2.2"
-walkdir = { version = "2", optional = true }
 
 # Cloud storage support
 base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
@@ -51,21 +51,24 @@ crc-fast = { version = "1.6" , optional = true }
 form_urlencoded = { version = "1.2", optional = true }
 http-body-util = { version = "0.1.2", optional = true }
 httparse = { version = "1.8.0", default-features = false, features = ["std"], optional = true }
-hyper = { version = "1.2", default-features = false, optional = true }
 md-5 = { version = "0.11.0", default-features = false, optional = true }
 quick-xml = { version = "0.41.0", features = ["serialize", "overlapped-lists"], optional = true }
-rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "thread_rng"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["http2"], optional = true }
-ring = { version = "0.17", default-features = false, features = ["std"], optional = true }
-aws-lc-rs = { version = "1.15", default-features = false, optional = true }
 rustls-pki-types = { version = "1.9", default-features = false, features = ["std"], optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
 serde_json = { version = "1.0", default-features = false, features = ["std"], optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 
-# Optional tokio feature
-tokio = { version = "1.29.0", features = ["sync", "macros", "rt", "time", "io-util"], optional = true }
 tracing = { version = "0.1", optional = true }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+chrono = { version = "0.4.34", default-features = false, features = ["clock"] }
+hyper = { version = "1.2", default-features = false, optional = true }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "thread_rng"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["http2"], optional = true }
+ring = { version = "0.17", default-features = false, features = ["std"], optional = true }
+aws-lc-rs = { version = "1.15", default-features = false, optional = true }
+tokio = { version = "1.29.0", features = ["sync", "macros", "rt", "time", "io-util"], optional = true }
+walkdir = { version = "2", optional = true }
 
 [target.'cfg(target_family="unix")'.dependencies]
 nix = { version = "0.31.1", default-features = false, optional = true }
@@ -77,44 +80,40 @@ windows-sys = { version = "0.61.2", default-features = false, features = ["Win32
 nix = { version = "0.31.1", features = ["fs"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-web-time = { version = "1.1.0" }
-wasm-bindgen-futures = "0.4.18"
-futures-channel = {version = "0.3", features = ["sink"]}
+futures-channel = { version = "0.3", features = ["sink"], optional = true }
+gloo-timers = { version = "0.3", features = ["futures"], optional = true }
+js-sys = { version = "0.3", optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
+wasm-bindgen-futures = { version = "0.4.18", optional = true }
+web-time = { version = "1.1.0", optional = true }
 
 [features]
 default = ["fs"]
+# Host-neutral request, response, object, and retry policy.
+http-base = ["dep:serde", "dep:quick-xml", "chrono/serde", "dep:http-body", "dep:http-body-util", "dep:tracing"]
 
-# Shared cloud/provider implementation dependencies.
-# This intentionally does NOT include reqwest or a bundled crypto provider.
-cloud-base = ["serde", "serde_json", "quick-xml", "hyper", "chrono/serde", "base64", "rand", "http-body-util", "form_urlencoded", "serde_urlencoded", "tokio"]
-
-# Built-in reqwest-based HTTP transport.
+# Shared provider dependencies. Native batteries remain selected by provider features.
+hyper = ["dep:hyper"]
+rand = ["dep:rand"]
+cloud-base = ["http-base", "dep:serde_json", "dep:base64", "hyper", "rand", "dep:form_urlencoded", "dep:serde_urlencoded", "tokio"]
 reqwest = ["dep:reqwest", "reqwest/stream"]
+aws-lc-rs = ["dep:aws-lc-rs", "dep:rustls-pki-types"]
+ring = ["dep:ring", "dep:rustls-pki-types"]
 
-# Bundled crypto providers.
-# Selecting one provides the default `CryptoProvider`; otherwise a custom
-# provider must be supplied at runtime.
-aws-lc-rs = ["dep:aws-lc-rs", "rustls-pki-types"]
-ring = ["dep:ring", "rustls-pki-types"]
+# Explicit JavaScript host capabilities for Fetch, timers, and jitter.
+web = ["dep:futures-channel", "dep:gloo-timers", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-time", "chrono/wasmbind"]
 
-# Implementation base features.
-# These compile provider logic without forcing reqwest or a crypto provider.
-azure-base = ["cloud-base", "httparse"]
+azure-base = ["cloud-base", "dep:httparse"]
 gcp-base = ["cloud-base"]
-aws-base = ["cloud-base", "crc-fast", "md-5"]
-http-base = ["cloud-base"]
+aws-base = ["cloud-base", "crc-fast", "dep:md-5"]
 
-# "Batteries-included" implementation features.
-# Each enables the default `reqwest` transport (with rustls) and `aws-lc-rs`.
-# This keeps object_store's bundled crypto provider aligned with reqwest/rustls,
-# which uses aws-lc-rs for TLS by default.
 azure = ["azure-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
 gcp = ["gcp-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
 aws = ["aws-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
-# HTTP/WebDAV doesn't sign object_store requests, but reqwest/rustls uses aws-lc-rs by default.
 http = ["http-base", "reqwest", "reqwest/rustls", "aws-lc-rs"]
 
-fs = ["walkdir", "tokio", "nix", "windows-sys"]
+fs = ["dep:walkdir", "tokio", "dep:nix", "dep:windows-sys"]
+tls-webpki-roots = ["reqwest?/rustls-tls-webpki-roots"]
 integration = ["rand", "tokio"]
 tokio = ["dep:tokio", "dep:tracing"]
 

@@ -20,16 +20,14 @@
 use crate::PutPayload;
 use crate::client::backoff::{Backoff, BackoffConfig};
 use crate::client::builder::HttpRequestBuilder;
+use crate::client::runtime::{RetryRuntime, RetryRuntimeError};
 use crate::client::{HttpClient, HttpError, HttpErrorKind, HttpRequest, HttpResponse};
 use futures_util::future::BoxFuture;
 use http::StatusCode;
 use http::header::LOCATION;
 use http::{Method, Uri};
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::info;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use web_time::{Duration, Instant};
 
 /// Retry request error
 #[derive(Debug)]
@@ -81,27 +79,51 @@ pub(crate) struct RetryContext {
     retries: usize,
     max_retries: usize,
     retry_timeout: Duration,
-    start: Instant,
+    runtime: RetryRuntime,
 }
 
 impl RetryContext {
     pub(crate) fn new(config: &RetryConfig) -> Self {
+        #[cfg(not(any(
+            all(
+                feature = "rand",
+                not(all(target_arch = "wasm32", target_os = "unknown"))
+            ),
+            all(feature = "web", target_arch = "wasm32", target_os = "unknown")
+        )))]
+        let backoff = Backoff::new(&config.backoff);
+        #[cfg(all(
+            feature = "rand",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        let backoff = Backoff::new_randomized(&config.backoff);
+        #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
+        let backoff = Backoff::new_web(&config.backoff);
+
         Self {
             max_retries: config.max_retries,
             retry_timeout: config.retry_timeout,
-            backoff: Backoff::new(&config.backoff),
+            backoff,
             retries: 0,
-            start: Instant::now(),
+            runtime: RetryRuntime::new(),
         }
     }
 
     pub(crate) fn exhausted(&self) -> bool {
-        self.retries >= self.max_retries || self.start.elapsed() > self.retry_timeout
+        self.retries >= self.max_retries || self.runtime.elapsed() > self.retry_timeout
     }
 
     pub(crate) fn backoff(&mut self) -> Duration {
         self.retries += 1;
         self.backoff.next()
+    }
+
+    pub(crate) async fn sleep(&self, duration: Duration) -> Result<(), RetryRuntimeError> {
+        self.runtime.sleep(duration).await
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.runtime.elapsed()
     }
 }
 
@@ -155,6 +177,15 @@ impl RetryError {
     }
 
     pub fn error(self, store: &'static str, path: String) -> crate::Error {
+        if matches!(
+            self.inner(),
+            RequestError::Http(error) if error.has_source::<RetryRuntimeError>()
+        ) {
+            return crate::Error::NotSupported {
+                source: Box::new(self),
+            };
+        }
+
         match self.status() {
             Some(StatusCode::NOT_FOUND) => crate::Error::NotFound {
                 path,
@@ -337,7 +368,7 @@ impl RetryableRequest {
             method: self.http.method().clone(),
             retries: ctx.retries,
             max_retries: ctx.max_retries,
-            elapsed: ctx.start.elapsed(),
+            elapsed: ctx.elapsed(),
             retry_timeout: ctx.retry_timeout,
             inner: error,
         }))
@@ -386,7 +417,9 @@ impl RetryableRequest {
                                 ctx.retries,
                                 ctx.max_retries,
                             );
-                            tokio::time::sleep(sleep).await;
+                            ctx.sleep(sleep).await.map_err(|source| {
+                                self.err(HttpError::new(HttpErrorKind::Unknown, source).into(), ctx)
+                            })?;
                         }
                     } else if status == StatusCode::NOT_MODIFIED {
                         return Err(self.err(RequestError::Status { status, body: None }, ctx));
@@ -428,7 +461,9 @@ impl RetryableRequest {
                             ctx.retries,
                             ctx.max_retries,
                         );
-                        tokio::time::sleep(sleep).await;
+                        ctx.sleep(sleep).await.map_err(|source| {
+                            self.err(HttpError::new(HttpErrorKind::Unknown, source).into(), ctx)
+                        })?;
                     }
                 }
                 Err(e) => {
@@ -454,7 +489,9 @@ impl RetryableRequest {
                         ctx.max_retries,
                         e,
                     );
-                    tokio::time::sleep(sleep).await;
+                    ctx.sleep(sleep).await.map_err(|source| {
+                        self.err(HttpError::new(HttpErrorKind::Unknown, source).into(), ctx)
+                    })?;
                 }
             }
         }

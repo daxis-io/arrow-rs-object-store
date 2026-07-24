@@ -31,9 +31,11 @@ pub(crate) enum RequestBuilderError {
     #[error("Invalid Header Name")]
     InvalidHeaderName(#[from] InvalidHeaderName),
 
+    #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
     #[error("JSON serialization error")]
     SerdeJson(#[from] serde_json::Error),
 
+    #[cfg(any(test, feature = "aws", feature = "gcp", feature = "azure"))]
     #[error("URL serialization error")]
     SerdeUrl(#[from] serde_urlencoded::ser::Error),
 }

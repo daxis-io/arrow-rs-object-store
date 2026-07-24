@@ -15,8 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use rand::{Rng, RngExt, rng};
 use std::time::Duration;
+
+#[cfg(any(
+    test,
+    all(
+        feature = "rand",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    )
+))]
+use rand::{Rng, RngExt, rng};
 
 /// Exponential backoff with decorrelated jitter algorithm
 ///
@@ -56,7 +64,22 @@ pub(crate) struct Backoff {
     next_backoff_secs: f64,
     max_backoff_secs: f64,
     base: f64,
-    rng: Option<Box<dyn Rng + Sync + Send>>,
+    jitter: Jitter,
+}
+
+enum Jitter {
+    #[allow(dead_code)]
+    Deterministic,
+    #[cfg(any(
+        test,
+        all(
+            feature = "rand",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        )
+    ))]
+    Random(Option<Box<dyn Rng + Sync + Send>>),
+    #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
+    Web,
 }
 
 impl std::fmt::Debug for Backoff {
@@ -72,24 +95,49 @@ impl std::fmt::Debug for Backoff {
 
 impl Backoff {
     /// Create a new [`Backoff`] from the provided [`BackoffConfig`]
+    #[allow(dead_code)]
     pub(crate) fn new(config: &BackoffConfig) -> Self {
+        Self::new_with_jitter(config, Jitter::Deterministic)
+    }
+
+    #[cfg(all(
+        feature = "rand",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    pub(crate) fn new_randomized(config: &BackoffConfig) -> Self {
         Self::new_with_rng(config, None)
+    }
+
+    #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn new_web(config: &BackoffConfig) -> Self {
+        Self::new_with_jitter(config, Jitter::Web)
     }
 
     /// Creates a new `Backoff` with the optional `rng`
     ///
     /// Used [`rand::rng()`] if no rng provided
+    #[cfg(any(
+        test,
+        all(
+            feature = "rand",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        )
+    ))]
     pub(crate) fn new_with_rng(
         config: &BackoffConfig,
         rng: Option<Box<dyn Rng + Sync + Send>>,
     ) -> Self {
+        Self::new_with_jitter(config, Jitter::Random(rng))
+    }
+
+    fn new_with_jitter(config: &BackoffConfig, jitter: Jitter) -> Self {
         let init_backoff = config.init_backoff.as_secs_f64();
         Self {
             init_backoff,
             next_backoff_secs: init_backoff,
             max_backoff_secs: config.max_backoff.as_secs_f64(),
             base: config.base,
-            rng,
+            jitter,
         }
     }
 
@@ -97,12 +145,29 @@ impl Backoff {
     pub(crate) fn next(&mut self) -> Duration {
         let range = self.init_backoff..(self.next_backoff_secs * self.base);
 
-        let rand_backoff = match self.rng.as_mut() {
-            Some(rng) => rng.random_range(range),
-            None => rng().random_range(range),
+        let next = match &mut self.jitter {
+            Jitter::Deterministic => (range.start + range.end) / 2.,
+            #[cfg(any(
+                test,
+                all(
+                    feature = "rand",
+                    not(all(target_arch = "wasm32", target_os = "unknown"))
+                )
+            ))]
+            Jitter::Random(Some(rng)) => rng.random_range(range),
+            #[cfg(any(
+                test,
+                all(
+                    feature = "rand",
+                    not(all(target_arch = "wasm32", target_os = "unknown"))
+                )
+            ))]
+            Jitter::Random(None) => rng().random_range(range),
+            #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
+            Jitter::Web => range.start + (range.end - range.start) * js_sys::Math::random(),
         };
 
-        let next_backoff = self.max_backoff_secs.min(rand_backoff);
+        let next_backoff = self.max_backoff_secs.min(next);
         Duration::from_secs_f64(std::mem::replace(&mut self.next_backoff_secs, next_backoff))
     }
 }
@@ -173,6 +238,21 @@ mod tests {
             assert_fuzzy_eq(backoff.next().as_secs_f64(), value);
             value =
                 (init_backoff_secs + (value * base - init_backoff_secs) / 2.).min(max_backoff_secs);
+        }
+    }
+
+    #[test]
+    fn test_host_neutral_backoff_is_deterministic() {
+        let config = BackoffConfig {
+            init_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_secs(1),
+            base: 2.,
+        };
+        let mut left = Backoff::new(&config);
+        let mut right = Backoff::new(&config);
+
+        for _ in 0..16 {
+            assert_eq!(left.next(), right.next());
         }
     }
 }
