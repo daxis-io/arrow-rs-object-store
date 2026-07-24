@@ -18,10 +18,9 @@
 //! Utilities for performing tokio-style buffered IO
 
 use crate::path::Path;
-use crate::{
-    Attributes, Extensions, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions,
-    PutOptions, PutPayloadMut, TagSet, WriteMultipart,
-};
+use crate::{Attributes, Extensions, ObjectMeta, ObjectStore, ObjectStoreExt, TagSet};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use crate::{PutMultipartOptions, PutOptions, PutPayloadMut, WriteMultipart};
 use bytes::Bytes;
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::ready;
@@ -218,6 +217,7 @@ impl AsyncBufRead for BufReader {
 /// Up to `capacity` bytes will be buffered in memory, and flushed on shutdown
 /// using [`ObjectStore::put_opts`]. If `capacity` is exceeded, data will instead be
 /// streamed using [`ObjectStore::put_multipart_opts`].
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub struct BufWriter {
     capacity: usize,
     max_concurrency: usize,
@@ -228,6 +228,7 @@ pub struct BufWriter {
     store: Arc<dyn ObjectStore>,
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl std::fmt::Debug for BufWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BufWriter")
@@ -236,6 +237,7 @@ impl std::fmt::Debug for BufWriter {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 enum BufWriterState {
     /// Buffer up to capacity bytes
     Buffer(Path, PutPayloadMut),
@@ -247,6 +249,7 @@ enum BufWriterState {
     Flush(BoxFuture<'static, crate::Result<()>>),
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl BufWriter {
     /// Create a new [`BufWriter`] from the provided [`ObjectStore`] and [`Path`]
     pub fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
@@ -372,6 +375,7 @@ impl BufWriter {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl AsyncWrite for BufWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -472,6 +476,104 @@ impl AsyncWrite for BufWriter {
                 }
             }
         }
+    }
+}
+
+/// A target-safe placeholder for the native buffered object writer.
+///
+/// Browser reads use [`BufReader`]. Object writes and multipart uploads are
+/// deliberately outside the browser profile, so this type preserves the
+/// target-independent API while rejecting the first attempted write.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub struct BufWriter {
+    _store: Arc<dyn ObjectStore>,
+    _path: Path,
+    capacity: usize,
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl std::fmt::Debug for BufWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufWriter")
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl BufWriter {
+    /// Create an unsupported browser object writer.
+    pub fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
+        Self::with_capacity(store, path, 10 * 1024 * 1024)
+    }
+
+    /// Create an unsupported browser object writer with the given capacity.
+    pub fn with_capacity(store: Arc<dyn ObjectStore>, path: Path, capacity: usize) -> Self {
+        Self {
+            _store: store,
+            _path: path,
+            capacity,
+        }
+    }
+
+    /// Preserve native builder compatibility without enabling browser uploads.
+    pub fn with_max_concurrency(self, _max_concurrency: usize) -> Self {
+        self
+    }
+
+    /// Preserve native builder compatibility without enabling browser uploads.
+    pub fn with_attributes(self, _attributes: Attributes) -> Self {
+        self
+    }
+
+    /// Preserve native builder compatibility without enabling browser uploads.
+    pub fn with_tags(self, _tags: TagSet) -> Self {
+        self
+    }
+
+    /// Preserve native builder compatibility without enabling browser uploads.
+    pub fn with_extensions(self, _extensions: Extensions) -> Self {
+        self
+    }
+
+    /// Reject browser object writes.
+    pub async fn put(&mut self, _bytes: Bytes) -> crate::Result<()> {
+        Err(browser_writer_unavailable())
+    }
+
+    /// No upload is started by the browser placeholder, so abort is a no-op.
+    pub async fn abort(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl AsyncWrite for BufWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        Poll::Ready(Err(Error::new(
+            ErrorKind::Unsupported,
+            browser_writer_unavailable(),
+        )))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn browser_writer_unavailable() -> crate::Error {
+    crate::Error::NotImplemented {
+        operation: "buffered object writes on target wasm32-unknown-unknown".to_string(),
+        implementer: "object_store::buffered::BufWriter".to_string(),
     }
 }
 
