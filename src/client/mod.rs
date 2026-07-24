@@ -913,6 +913,10 @@ impl GetOptionsExt for HttpRequestBuilder {
             self = self.header(RANGE, range.to_string());
         }
 
+        if let Some(if_range) = extensions.get::<get::IfRange>() {
+            self = self.header(IF_RANGE, if_range.0.as_str());
+        }
+
         if let Some(tag) = if_match {
             self = self.header(IF_MATCH, tag);
         }

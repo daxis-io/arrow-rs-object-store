@@ -30,8 +30,8 @@ use futures_util::stream::BoxStream;
 use http::StatusCode;
 use http::header::ToStrError;
 use http::header::{
-    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_RANGE,
-    CONTENT_TYPE,
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE,
 };
 use http_body_util::BodyExt;
 use std::ops::Range;
@@ -76,6 +76,7 @@ impl<T: GetClient> GetClientExt for Arc<T> {
     }
 }
 
+#[derive(Debug, Clone)]
 struct ContentRange {
     /// The range of the object returned
     range: Range<u64>,
@@ -96,17 +97,25 @@ impl ContentRange {
 
         let start = start_s.parse().ok()?;
         let end: u64 = end_s.parse().ok()?;
+        let end = end.checked_add(1)?;
+
+        if start >= end || end > size {
+            return None;
+        }
 
         Some(Self {
             size,
-            range: start..end + 1,
+            range: start..end,
         })
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct IfRange(pub(crate) String);
+
 /// A specialized `Error` for get-related errors
 #[derive(Debug, thiserror::Error)]
-enum GetResultError {
+pub(crate) enum GetResultError {
     #[error(transparent)]
     Header {
         #[from]
@@ -122,7 +131,9 @@ enum GetResultError {
     #[error("Received non-partial response when range requested")]
     NotPartial,
 
-    #[error("Content-Range header not present in partial response")]
+    #[error(
+        "Content-Range header not present in partial response; for browser requests verify CORS exposes Content-Range"
+    )]
     NoContentRange,
 
     #[error("Failed to parse value for CONTENT_RANGE header: \"{value}\"")]
@@ -154,6 +165,18 @@ enum GetResultError {
         expected: Range<u64>,
         actual: Range<u64>,
     },
+
+    #[error("Range response used unsupported Content-Encoding \"{encoding}\"; expected identity")]
+    EncodedRange { encoding: String },
+
+    #[error("Range response declared {declared} bytes for Content-Range {actual:?}")]
+    InvalidRangeLength { declared: u64, actual: Range<u64> },
+
+    #[error("Response body ended at byte {actual}, expected byte {expected}")]
+    TruncatedBody { expected: u64, actual: u64 },
+
+    #[error("Response body exceeded expected end byte {expected}")]
+    BodyTooLong { expected: u64 },
 }
 
 /// Retry context for a streaming get request
@@ -208,7 +231,20 @@ impl<T: GetClient> GetContext<T> {
                     match (ret, &etag) {
                         (Ok(frame), _) => match frame.into_data() {
                             Ok(bytes) => {
-                                range.start += bytes.len() as u64;
+                                let next = range
+                                    .start
+                                    .checked_add(bytes.len() as u64)
+                                    .ok_or_else(|| {
+                                        Self::err(GetResultError::BodyTooLong {
+                                            expected: range.end,
+                                        })
+                                    })?;
+                                if next > range.end {
+                                    return Err(Self::err(GetResultError::BodyTooLong {
+                                        expected: range.end,
+                                    }));
+                                }
+                                range.start = next;
                                 return Ok(Some((bytes, (ctx, body, etag, range))));
                             }
                             Err(_) => continue, // Isn't data frame
@@ -224,10 +260,13 @@ impl<T: GetClient> GetContext<T> {
 
                             ctx.retry_ctx.sleep(sleep).await.map_err(Self::err)?;
 
-                            let options = GetOptions {
+                            let mut options = GetOptions {
                                 range: Some(GetRange::Bounded(range.clone())),
                                 ..ctx.options.clone()
                             };
+                            if is_strong_etag(etag) {
+                                options.extensions.insert(IfRange(etag.clone()));
+                            }
 
                             // Note: this will potentially retry internally if applicable
                             let request = ctx
@@ -244,10 +283,63 @@ impl<T: GetClient> GetContext<T> {
                                 return Err(Self::err(e));
                             }
 
-                            body = retry_body;
+                            let content_range =
+                                validate_range_response(&parts.headers).map_err(Self::err)?;
+                            let actual = content_range.range;
+
+                            if actual == range {
+                                body = retry_body;
+                            } else if actual.start <= range.start && actual.end >= range.end {
+                                let skip = (range.start - actual.start) as usize;
+                                let mut skipped = 0;
+                                let mut retry_body = retry_body;
+                                while skipped < skip {
+                                    let frame = retry_body
+                                        .frame()
+                                        .await
+                                        .ok_or_else(|| {
+                                            Self::err(GetResultError::UnexpectedRange {
+                                                expected: range.clone(),
+                                                actual: actual.clone(),
+                                            })
+                                        })?
+                                        .map_err(Self::err)?;
+                                    let Some(bytes) = frame.into_data().ok() else {
+                                        continue;
+                                    };
+                                    let remaining = skip - skipped;
+                                    if bytes.len() <= remaining {
+                                        skipped += bytes.len();
+                                    } else {
+                                        let keep = bytes.slice(remaining..);
+                                        let next = range.start + keep.len() as u64;
+                                        if next > range.end {
+                                            return Err(Self::err(GetResultError::BodyTooLong {
+                                                expected: range.end,
+                                            }));
+                                        }
+                                        range.start = next;
+                                        body = retry_body;
+                                        let etag = Some(etag.clone());
+                                        return Ok(Some((keep, (ctx, body, etag, range))));
+                                    }
+                                }
+                                body = retry_body;
+                            } else {
+                                return Err(Self::err(GetResultError::UnexpectedRange {
+                                    expected: range,
+                                    actual,
+                                }));
+                            }
                         }
                         (Err(e), _) => return Err(Self::err(e)),
                     }
+                }
+                if range.start != range.end {
+                    return Err(Self::err(GetResultError::TruncatedBody {
+                        expected: range.end,
+                        actual: range.start,
+                    }));
                 }
                 Ok(None)
             },
@@ -275,7 +367,7 @@ fn get_range_meta(
             return Err(GetResultError::NotPartial);
         }
 
-        let value = parse_range(&response.headers)?;
+        let value = validate_range_response(&response.headers)?;
         let actual = value.range;
 
         // Update size to reflect the full size of the object (#5272)
@@ -292,6 +384,50 @@ fn get_range_meta(
     };
 
     Ok((range, meta))
+}
+
+fn validate_range_response(headers: &http::HeaderMap) -> Result<ContentRange, GetResultError> {
+    validate_identity_encoding(headers)?;
+    let content_range = parse_range(headers)?;
+    let content_length = headers
+        .get(CONTENT_LENGTH)
+        .ok_or(crate::client::header::Error::MissingContentLength)?
+        .to_str()
+        .map_err(|source| crate::client::header::Error::BadHeader { source })?;
+    let declared = content_length.parse().map_err(|source| {
+        crate::client::header::Error::InvalidContentLength {
+            content_length: content_length.into(),
+            source,
+        }
+    })?;
+    let actual_length = content_range.range.end - content_range.range.start;
+    if declared != actual_length {
+        return Err(GetResultError::InvalidRangeLength {
+            declared,
+            actual: content_range.range,
+        });
+    }
+    Ok(content_range)
+}
+
+pub(crate) fn validate_identity_encoding(headers: &http::HeaderMap) -> Result<(), GetResultError> {
+    let Some(value) = headers.get(CONTENT_ENCODING) else {
+        return Ok(());
+    };
+    let encoding = value
+        .to_str()
+        .map_err(|source| GetResultError::InvalidContentEncoding { source })?;
+    if !encoding.trim().eq_ignore_ascii_case("identity") {
+        return Err(GetResultError::EncodedRange {
+            encoding: encoding.into(),
+        });
+    }
+    Ok(())
+}
+
+fn is_strong_etag(etag: &str) -> bool {
+    let etag = etag.trim();
+    etag.starts_with('"') && etag.ends_with('"') && !etag.starts_with("W/")
 }
 
 /// Extracts the [CONTENT_RANGE] header
@@ -372,7 +508,6 @@ fn get_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::header::*;
 
     fn make_response(
         object_size: usize,
@@ -418,7 +553,7 @@ mod tests {
 
         let get_range = GetRange::from(2..3);
 
-        let resp = make_response(12, StatusCode::PARTIAL_CONTENT, Some("bytes 2-2/12"), None);
+        let resp = make_response(1, StatusCode::PARTIAL_CONTENT, Some("bytes 2-2/12"), None);
         let (range, meta) = get_range_meta(CFG, &path, Some(&get_range), &resp).unwrap();
         assert_eq!(meta.size, 12);
         assert_eq!(range, 2..3);
@@ -430,7 +565,7 @@ mod tests {
             "Received non-partial response when range requested"
         );
 
-        let resp = make_response(12, StatusCode::PARTIAL_CONTENT, Some("bytes 2-3/12"), None);
+        let resp = make_response(2, StatusCode::PARTIAL_CONTENT, Some("bytes 2-3/12"), None);
         let err = get_range_meta(CFG, &path, Some(&get_range), &resp).unwrap_err();
         assert_eq!(err.to_string(), "Requested 2..3, got 2..4");
 
@@ -445,24 +580,61 @@ mod tests {
         let err = get_range_meta(CFG, &path, Some(&get_range), &resp).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Content-Range header not present in partial response"
+            "Content-Range header not present in partial response; for browser requests verify CORS exposes Content-Range"
         );
 
-        let resp = make_response(2, StatusCode::PARTIAL_CONTENT, Some("bytes 2-3/2"), None);
+        let resp = make_response(2, StatusCode::PARTIAL_CONTENT, Some("bytes 0-1/2"), None);
         let err = get_range_meta(CFG, &path, Some(&get_range), &resp).unwrap_err();
         assert_eq!(
             err.to_string(),
             "Wanted range starting at 2, but object was only 2 bytes long"
         );
 
-        let resp = make_response(6, StatusCode::PARTIAL_CONTENT, Some("bytes 2-5/6"), None);
+        let resp = make_response(4, StatusCode::PARTIAL_CONTENT, Some("bytes 2-5/6"), None);
         let (range, meta) = get_range_meta(CFG, &path, Some(&GetRange::Suffix(4)), &resp).unwrap();
         assert_eq!(meta.size, 6);
         assert_eq!(range, 2..6);
 
-        let resp = make_response(6, StatusCode::PARTIAL_CONTENT, Some("bytes 2-3/6"), None);
+        let resp = make_response(2, StatusCode::PARTIAL_CONTENT, Some("bytes 2-3/6"), None);
         let err = get_range_meta(CFG, &path, Some(&GetRange::Suffix(4)), &resp).unwrap_err();
         assert_eq!(err.to_string(), "Requested 2..6, got 2..4");
+    }
+
+    #[test]
+    fn test_get_range_meta_rejects_encoded_body() {
+        let path = Path::from("test");
+        let get_range = GetRange::from(2..5);
+        let resp = make_response(
+            3,
+            StatusCode::PARTIAL_CONTENT,
+            Some("bytes 2-4/12"),
+            Some(vec![("content-encoding", "gzip")]),
+        );
+
+        let err = get_range_meta(CFG, &path, Some(&get_range), &resp).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Range response used unsupported Content-Encoding \"gzip\"; expected identity"
+        );
+    }
+
+    #[test]
+    fn test_get_range_meta_rejects_invalid_lengths() {
+        let path = Path::from("test");
+        let get_range = GetRange::from(2..5);
+        let resp = make_response(2, StatusCode::PARTIAL_CONTENT, Some("bytes 2-4/12"), None);
+
+        let err = get_range_meta(CFG, &path, Some(&get_range), &resp).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Range response declared 2 bytes for Content-Range 2..5"
+        );
+
+        assert!(ContentRange::from_str("bytes 4-2/12").is_none());
+        assert!(ContentRange::from_str("bytes 2-12/12").is_none());
+        assert!(
+            ContentRange::from_str("bytes 2-18446744073709551615/18446744073709551615").is_none()
+        );
     }
 
     #[test]
@@ -490,7 +662,10 @@ mod http_tests {
     use crate::{ClientOptions, ObjectStoreExt, RetryConfig};
     use bytes::Bytes;
     use futures_util::FutureExt;
-    use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
+    use http::header::{
+        ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG,
+        IF_RANGE, RANGE,
+    };
     use http::{Response, StatusCode};
     use hyper::body::Frame;
     use std::pin::Pin;
@@ -676,15 +851,15 @@ mod http_tests {
 
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(CONTENT_LENGTH, 3)
+                .header(CONTENT_LENGTH, 4)
                 .header(ETAG, "123")
                 .header(CONTENT_RANGE, "bytes 6-9/10")
-                .body("123".to_string())
+                .body("1234".to_string())
                 .unwrap()
         });
 
         let ret = store.get(&path).await.unwrap().bytes().await.unwrap();
-        assert_eq!(ret.as_ref(), b"banana123");
+        assert_eq!(ret.as_ref(), b"banana1234");
 
         // Should retry multiple times
         mock.push(
@@ -771,5 +946,182 @@ mod http_tests {
             err.to_string(),
             "Generic HTTP error: HTTP error: request or response body error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_retry_validates_content_range_and_sends_if_range() {
+        let mock = MockServer::new().await;
+        let retry = RetryConfig {
+            backoff: Default::default(),
+            max_retries: 3,
+            retry_timeout: Duration::from_secs(1000),
+        };
+
+        let options = ClientOptions::new().with_allow_http(true);
+        let store = HttpBuilder::new()
+            .with_client_options(options)
+            .with_retry(retry)
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+        let path = Path::from("test");
+
+        mock.push(
+            Response::builder()
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"abc\"")
+                .body(Chunked::new(vec![
+                    Ok(Bytes::from_static(b"hello")),
+                    Err(()),
+                ]))
+                .unwrap(),
+        );
+
+        mock.push_fn(|req| {
+            assert_eq!(req.headers().get(RANGE).unwrap(), "bytes=5-9");
+            assert_eq!(req.headers().get(IF_RANGE).unwrap(), "\"abc\"");
+            assert_eq!(req.headers().get(ACCEPT_ENCODING).unwrap(), "identity");
+
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"abc\"")
+                .header(CONTENT_RANGE, "bytes 0-9/10")
+                .body("helloworld".to_string())
+                .unwrap()
+        });
+
+        let result = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(result.as_ref(), b"helloworld");
+    }
+
+    #[tokio::test]
+    async fn test_retry_rejects_changed_if_range_validator() {
+        let mock = MockServer::new().await;
+        let retry = RetryConfig {
+            backoff: Default::default(),
+            max_retries: 3,
+            retry_timeout: Duration::from_secs(1000),
+        };
+        let options = ClientOptions::new().with_allow_http(true);
+        let store = HttpBuilder::new()
+            .with_client_options(options)
+            .with_retry(retry)
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+        let path = Path::from("test");
+
+        mock.push(
+            Response::builder()
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"abc\"")
+                .body(Chunked::new(vec![
+                    Ok(Bytes::from_static(b"hello")),
+                    Err(()),
+                ]))
+                .unwrap(),
+        );
+        mock.push_fn(|req| {
+            assert_eq!(req.headers().get(IF_RANGE).unwrap(), "\"abc\"");
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"changed\"")
+                .body("helloworld".to_string())
+                .unwrap()
+        });
+
+        let error = store.get(&path).await.unwrap().bytes().await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("did not honor If-Range"), "{message}");
+        assert!(message.contains("changed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn test_range_full_object_fallback_is_explicit_and_bounded() {
+        let path = Path::from("test");
+
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"abc\"")
+                .body("abcdefghij".to_string())
+                .unwrap(),
+        );
+        let options = ClientOptions::new().with_allow_http(true);
+        let strict = HttpBuilder::new()
+            .with_client_options(options.clone())
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+        let error = strict.get_range(&path, 2..6).await.unwrap_err();
+        assert!(error.to_string().contains("did not honor"));
+
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"abc\"")
+                .body("abcdefghij".to_string())
+                .unwrap(),
+        );
+        let bounded = HttpBuilder::new()
+            .with_client_options(options.clone())
+            .with_max_full_object_fallback_size(16)
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+        let bytes = bounded.get_range(&path, 2..6).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"cdef");
+
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"abc\"")
+                .body("abcdefghij".to_string())
+                .unwrap(),
+        );
+        let bounded = HttpBuilder::new()
+            .with_client_options(options)
+            .with_max_full_object_fallback_size(4)
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+        let error = bounded.get_range(&path, 2..6).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("10-byte object exceeds configured 4-byte")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_range_response_requires_identity_encoding() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_eq!(req.headers().get(ACCEPT_ENCODING).unwrap(), "identity");
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_LENGTH, 4)
+                .header(CONTENT_RANGE, "bytes 1-4/10")
+                .header(CONTENT_ENCODING, "gzip")
+                .body("bcde".to_string())
+                .unwrap()
+        });
+
+        let options = ClientOptions::new().with_allow_http(true);
+        let store = HttpBuilder::new()
+            .with_client_options(options)
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+        let error = store
+            .get_range(&Path::from("test"), 1..5)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("expected identity"));
     }
 }

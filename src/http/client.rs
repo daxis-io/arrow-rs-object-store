@@ -16,21 +16,26 @@
 // under the License.
 
 use super::STORE;
-use crate::client::get::GetClient;
+use crate::client::get::{GetClient, IfRange, validate_identity_encoding};
 use crate::client::header::HeaderConfig;
 use crate::client::retry::{self, RetryConfig, RetryContext, RetryExt};
 use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpResponse};
 use crate::path::{DELIMITER, Path};
 use crate::util::deserialize_rfc1123;
-use crate::{Attribute, Attributes, ClientOptions, GetOptions, ObjectMeta, PutPayload, Result};
+use crate::{
+    Attribute, Attributes, ClientOptions, GetOptions, GetRange, ObjectMeta, PutPayload, Result,
+};
 use async_trait::async_trait;
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 use chrono::{DateTime, Utc};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use http::header::ACCEPT_ENCODING;
 use http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
-    CONTENT_TYPE,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG,
 };
 use http::{Method, StatusCode};
+use http_body_util::BodyExt;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use url::Url;
@@ -46,8 +51,50 @@ enum Error {
     #[error("Request error: {}", source)]
     Reqwest { source: HttpError },
 
-    #[error("Range request not supported by {}", href)]
+    #[error("Server did not honor the range request for {href}")]
     RangeNotSupported { href: String },
+
+    #[error(
+        "Server did not honor If-Range for {href}; expected validator {expected}, received {actual:?}"
+    )]
+    RangeValidatorChanged {
+        href: String,
+        expected: String,
+        actual: Option<String>,
+    },
+
+    #[error(
+        "Cannot buffer range fallback for {href}: {object_size}-byte object exceeds configured {max_size}-byte limit"
+    )]
+    RangeFallbackTooLarge {
+        href: String,
+        object_size: u64,
+        max_size: u64,
+    },
+
+    #[error("Range fallback for {href} declared {declared} bytes but returned {actual} bytes")]
+    RangeFallbackLength {
+        href: String,
+        declared: u64,
+        actual: u64,
+    },
+
+    #[error(
+        "Range fallback for {href} omitted Content-Length; for browser requests verify CORS exposes Content-Length"
+    )]
+    MissingRangeFallbackLength { href: String },
+
+    #[error("Range fallback for {href} returned invalid Content-Length \"{value}\"")]
+    InvalidRangeFallbackLength { href: String, value: String },
+
+    #[error("Failed to read bounded range fallback for {href}: {source}")]
+    RangeFallbackBody { href: String, source: HttpError },
+
+    #[error("Invalid fallback range for {href}: {source}")]
+    InvalidRangeFallback {
+        href: String,
+        source: crate::util::InvalidGetRange,
+    },
 
     #[error("Error decoding PROPFIND response: {}", source)]
     InvalidPropFind { source: quick_xml::de::DeError },
@@ -96,6 +143,7 @@ pub(crate) struct Client {
     client: HttpClient,
     retry_config: RetryConfig,
     client_options: ClientOptions,
+    max_full_object_fallback_size: Option<u64>,
 }
 
 impl Client {
@@ -104,12 +152,14 @@ impl Client {
         client: HttpClient,
         client_options: ClientOptions,
         retry_config: RetryConfig,
+        max_full_object_fallback_size: Option<u64>,
     ) -> Self {
         Self {
             url,
             retry_config,
             client_options,
             client,
+            max_full_object_fallback_size,
         }
     }
 
@@ -121,6 +171,132 @@ impl Client {
         let mut url = self.url.clone();
         url.path_segments_mut().unwrap().extend(location.parts());
         url.to_string()
+    }
+
+    async fn normalize_range_response(
+        &self,
+        path: &Path,
+        requested: GetRange,
+        if_range: Option<String>,
+        response: HttpResponse,
+    ) -> Result<HttpResponse> {
+        let href = path.to_string();
+        let status = response.status();
+        let actual_etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        if let Some(expected) = if_range {
+            if status != StatusCode::PARTIAL_CONTENT
+                || actual_etag.as_deref() != Some(expected.as_str())
+            {
+                return Err(Error::RangeValidatorChanged {
+                    href,
+                    expected,
+                    actual: actual_etag,
+                }
+                .into());
+            }
+        }
+
+        if status == StatusCode::PARTIAL_CONTENT {
+            return Ok(response);
+        }
+
+        if status != StatusCode::OK {
+            return Err(crate::Error::NotSupported {
+                source: Box::new(Error::RangeNotSupported { href }),
+            });
+        }
+
+        let Some(max_size) = self.max_full_object_fallback_size else {
+            return Err(crate::Error::NotSupported {
+                source: Box::new(Error::RangeNotSupported { href }),
+            });
+        };
+
+        validate_identity_encoding(response.headers()).map_err(|source| crate::Error::Generic {
+            store: STORE,
+            source: Box::new(source),
+        })?;
+
+        let content_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .ok_or_else(|| Error::MissingRangeFallbackLength { href: href.clone() })?
+            .to_str()
+            .map_err(|_| Error::InvalidRangeFallbackLength {
+                href: href.clone(),
+                value: "<non-ASCII>".into(),
+            })?;
+        let declared = content_length
+            .parse()
+            .map_err(|_| Error::InvalidRangeFallbackLength {
+                href: href.clone(),
+                value: content_length.into(),
+            })?;
+
+        if declared > max_size || declared > usize::MAX as u64 {
+            return Err(Error::RangeFallbackTooLarge {
+                href,
+                object_size: declared,
+                max_size,
+            }
+            .into());
+        }
+
+        let range = requested
+            .as_range(declared)
+            .map_err(|source| Error::InvalidRangeFallback {
+                href: href.clone(),
+                source,
+            })?;
+        let (mut parts, mut body) = response.into_parts();
+        let mut bytes = BytesMut::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|source| Error::RangeFallbackBody {
+                href: href.clone(),
+                source,
+            })?;
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            let actual = bytes.len() as u64 + data.len() as u64;
+            if actual > max_size {
+                return Err(Error::RangeFallbackTooLarge {
+                    href,
+                    object_size: actual,
+                    max_size,
+                }
+                .into());
+            }
+            bytes.extend_from_slice(&data);
+        }
+
+        let actual = bytes.len() as u64;
+        if actual != declared {
+            return Err(Error::RangeFallbackLength {
+                href,
+                declared,
+                actual,
+            }
+            .into());
+        }
+
+        let start = range.start as usize;
+        let end = range.end as usize;
+        let selected = bytes.freeze().slice(start..end);
+        parts.status = StatusCode::PARTIAL_CONTENT;
+        parts.headers.insert(CONTENT_LENGTH, selected.len().into());
+        parts.headers.insert(
+            CONTENT_RANGE,
+            format!("bytes {}-{}/{}", range.start, range.end - 1, declared)
+                .parse()
+                .expect("generated Content-Range must be valid"),
+        );
+        Ok(HttpResponse::from_parts(parts, selected.into()))
     }
 
     /// Create a directory with `path` using MKCOL
@@ -374,8 +550,17 @@ impl GetClient for Client {
             true => Method::HEAD,
             false => Method::GET,
         };
-        let has_range = options.range.is_some();
+        let range = options.range.clone();
+        let if_range = options
+            .extensions
+            .get::<IfRange>()
+            .map(|value| value.0.clone());
         let builder = self.client.request(method, url);
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let builder = match &range {
+            Some(_) => builder.header(ACCEPT_ENCODING, "identity"),
+            None => builder,
+        };
 
         let res = builder
             .with_get_options(options)
@@ -397,14 +582,10 @@ impl GetClient for Client {
                 .into(),
             })?;
 
-        // We expect a 206 Partial Content response if a range was requested
-        // a 200 OK response would indicate the server did not fulfill the request
-        if has_range && res.status() != StatusCode::PARTIAL_CONTENT {
-            return Err(crate::Error::NotSupported {
-                source: Box::new(Error::RangeNotSupported {
-                    href: path.to_string(),
-                }),
-            });
+        if let Some(range) = range {
+            return self
+                .normalize_range_response(path, range, if_range, res)
+                .await;
         }
 
         Ok(res)
@@ -515,4 +696,55 @@ pub(crate) struct Prop {
 #[derive(Deserialize)]
 pub(crate) struct ResourceType {
     collection: Option<()>,
+}
+
+#[cfg(all(test, feature = "http", not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    fn client(max_size: u64) -> Client {
+        Client::new(
+            Url::parse("http://example.invalid/").unwrap(),
+            HttpClient::new(reqwest::Client::new()),
+            ClientOptions::new().with_allow_http(true),
+            RetryConfig::default(),
+            Some(max_size),
+        )
+    }
+
+    #[tokio::test]
+    async fn bounded_fallback_stops_before_unbounded_buffering() {
+        let response = http::Response::builder()
+            .header(CONTENT_LENGTH, 3)
+            .body("12345".to_string().into())
+            .unwrap();
+
+        let error = client(4)
+            .normalize_range_response(&Path::from("test"), GetRange::Bounded(0..2), None, response)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("5-byte object exceeds configured 4-byte"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_fallback_rejects_actual_length_mismatch() {
+        let response = http::Response::builder()
+            .header(CONTENT_LENGTH, 3)
+            .body("12".to_string().into())
+            .unwrap();
+
+        let error = client(4)
+            .normalize_range_response(&Path::from("test"), GetRange::Bounded(0..2), None, response)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("declared 3 bytes but returned 2 bytes"),
+            "{message}"
+        );
+    }
 }
