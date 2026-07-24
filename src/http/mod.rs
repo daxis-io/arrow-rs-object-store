@@ -238,6 +238,7 @@ pub struct HttpBuilder {
     client_options: ClientOptions,
     retry_config: RetryConfig,
     http_connector: Option<Arc<dyn HttpConnector>>,
+    max_full_object_fallback_size: Option<u64>,
 }
 
 impl HttpBuilder {
@@ -278,6 +279,15 @@ impl HttpBuilder {
         self
     }
 
+    /// Permit a server that ignores a range request to return a full object up to `max_bytes`.
+    ///
+    /// The response is buffered only after its declared length is checked against this bound.
+    /// Full-object fallback is disabled by default.
+    pub fn with_max_full_object_fallback_size(mut self, max_bytes: u64) -> Self {
+        self.max_full_object_fallback_size = Some(max_bytes);
+        self
+    }
+
     /// Build an [`HttpStore`] with the configured options
     pub fn build(self) -> Result<HttpStore> {
         let url = self.url.ok_or(Error::MissingUrl)?;
@@ -291,6 +301,7 @@ impl HttpBuilder {
                 client,
                 self.client_options,
                 self.retry_config,
+                self.max_full_object_fallback_size,
             )),
         })
     }

@@ -1129,6 +1129,66 @@ mod http_tests {
     }
 
     #[tokio::test]
+    async fn test_range_full_object_fallback_is_explicit_and_bounded() {
+        let path = Path::from("test");
+
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"abc\"")
+                .body("abcdefghij".to_string())
+                .unwrap(),
+        );
+        let options = ClientOptions::new().with_allow_http(true);
+        let strict = HttpBuilder::new()
+            .with_client_options(options.clone())
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+        let error = strict.get_range(&path, 2..6).await.unwrap_err();
+        assert!(error.to_string().contains("did not honor"));
+
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"abc\"")
+                .body("abcdefghij".to_string())
+                .unwrap(),
+        );
+        let bounded = HttpBuilder::new()
+            .with_client_options(options.clone())
+            .with_max_full_object_fallback_size(16)
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+        let bytes = bounded.get_range(&path, 2..6).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"cdef");
+
+        let mock = MockServer::new().await;
+        mock.push(
+            Response::builder()
+                .header(CONTENT_LENGTH, 10)
+                .header(ETAG, "\"abc\"")
+                .body("abcdefghij".to_string())
+                .unwrap(),
+        );
+        let bounded = HttpBuilder::new()
+            .with_client_options(options)
+            .with_max_full_object_fallback_size(4)
+            .with_url(mock.url())
+            .build()
+            .unwrap();
+        let error = bounded.get_range(&path, 2..6).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("10-byte object exceeds configured 4-byte")
+        );
+    }
+
+    #[tokio::test]
     async fn test_range_response_requires_identity_encoding() {
         let mock = MockServer::new().await;
         mock.push_fn(|req| {
