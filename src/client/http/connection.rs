@@ -56,6 +56,15 @@ pub struct HttpError {
     source: Box<dyn Error + Send + Sync>,
 }
 
+#[cfg(all(feature = "reqwest", target_arch = "wasm32", target_os = "unknown"))]
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "browser Fetch failed; verify CORS allows Range and If-Range request headers and exposes Content-Range, Content-Length, Content-Encoding, and ETag: {source}"
+)]
+struct BrowserFetchError {
+    source: reqwest::Error,
+}
+
 /// Identifies the kind of [`HttpError`]
 ///
 /// This is used, among other things, to determine if a request can be retried
@@ -150,11 +159,13 @@ impl HttpError {
                 break;
             }
         }
-        Self {
-            kind,
-            // We strip URL as it will be included by RetryError if not sensitive
-            source: Box::new(e.without_url()),
-        }
+        // We strip URL as it will be included by RetryError if not sensitive
+        let source = e.without_url();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let source: Box<dyn Error + Send + Sync> = Box::new(BrowserFetchError { source });
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let source: Box<dyn Error + Send + Sync> = Box::new(source);
+        Self { kind, source }
     }
 
     /// Returns the [`HttpErrorKind`]
@@ -366,7 +377,7 @@ impl HttpConnector for ReqwestConnector {
 /// ```
 /// # use std::sync::Arc;
 /// # use tokio::runtime::Runtime;
-/// # use object_store::azure::MicrosoftAzureBuilder;
+/// # use object_store::http::HttpBuilder;
 /// # use object_store::client::SpawnedReqwestConnector;
 /// # use object_store::ObjectStore;
 /// # fn get_io_runtime() -> Runtime {
@@ -378,10 +389,9 @@ impl HttpConnector for ReqwestConnector {
 /// // configure a store using the runtime.
 /// let handle = io_runtime.handle().clone(); // get a handle to the same runtime
 /// let store: Arc<dyn ObjectStore> = Arc::new(
-///   MicrosoftAzureBuilder::new()
+///   HttpBuilder::new()
+///     .with_url("https://example.com")
 ///     .with_http_connector(SpawnedReqwestConnector::new(handle))
-///     .with_container_name("my_container")
-///     .with_account("my_account")
 ///     .build()?
 ///  );
 /// // any requests made using store will be spawned on the io_runtime
