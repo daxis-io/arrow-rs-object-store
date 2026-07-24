@@ -91,12 +91,12 @@ web-time = { version = "1.1.0", optional = true }
 [features]
 default = ["fs"]
 # Host-neutral request, response, object, and retry policy.
-http-base = ["dep:serde", "dep:quick-xml", "chrono/serde", "dep:http-body", "dep:http-body-util", "dep:tracing"]
+http-base = ["dep:serde", "dep:quick-xml", "chrono/serde", "dep:http-body", "dep:http-body-util", "dep:tracing", "dep:form_urlencoded", "dep:serde_urlencoded"]
 
 # Shared provider dependencies. Native batteries remain selected by provider features.
 hyper = ["dep:hyper"]
 rand = ["dep:rand"]
-cloud-base = ["http-base", "dep:serde_json", "dep:base64", "hyper", "rand", "dep:form_urlencoded", "dep:serde_urlencoded", "tokio"]
+cloud-base = ["http-base", "dep:serde_json", "dep:base64", "hyper", "rand", "tokio"]
 reqwest = ["dep:reqwest", "reqwest/stream"]
 aws-lc-rs = ["dep:aws-lc-rs", "dep:rustls-pki-types"]
 ring = ["dep:ring", "dep:rustls-pki-types"]
