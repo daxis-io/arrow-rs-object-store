@@ -139,7 +139,7 @@ impl ObjectStoreScheme {
     }
 }
 
-#[cfg(feature = "cloud-base")]
+#[cfg(feature = "http-base")]
 macro_rules! builder_opts {
     ($builder:ty, $url:expr, $options:expr) => {{
         let builder = $options.into_iter().fold(
