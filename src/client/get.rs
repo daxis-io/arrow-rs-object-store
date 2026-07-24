@@ -17,7 +17,7 @@
 
 use crate::client::header::{HeaderConfig, get_etag, header_meta};
 use crate::client::retry::RetryContext;
-use crate::client::{HttpResponse, HttpResponseBody};
+use crate::client::{HttpError, HttpErrorKind, HttpResponse, HttpResponseBody};
 use crate::path::Path;
 use crate::{
     Attribute, Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ObjectMeta, Result,
@@ -227,7 +227,26 @@ impl<T: GetClient> GetContext<T> {
         futures_util::stream::try_unfold(
             (self, body, etag, range),
             |(mut ctx, mut body, etag, mut range)| async move {
-                while let Some(ret) = body.frame().await {
+                loop {
+                    let ret = match body.frame().await {
+                        Some(ret) => ret,
+                        None if range.start == range.end => return Ok(None),
+                        None if etag.is_some() && !ctx.retry_ctx.exhausted() => {
+                            Err(HttpError::new(
+                                HttpErrorKind::Interrupted,
+                                GetResultError::TruncatedBody {
+                                    expected: range.end,
+                                    actual: range.start,
+                                },
+                            ))
+                        }
+                        None => {
+                            return Err(Self::err(GetResultError::TruncatedBody {
+                                expected: range.end,
+                                actual: range.start,
+                            }));
+                        }
+                    };
                     match (ret, &etag) {
                         (Ok(frame), _) => match frame.into_data() {
                             Ok(bytes) => {
@@ -335,13 +354,6 @@ impl<T: GetClient> GetContext<T> {
                         (Err(e), _) => return Err(Self::err(e)),
                     }
                 }
-                if range.start != range.end {
-                    return Err(Self::err(GetResultError::TruncatedBody {
-                        expected: range.end,
-                        actual: range.start,
-                    }));
-                }
-                Ok(None)
             },
         )
             .boxed()
@@ -508,6 +520,7 @@ fn get_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_response(
         object_size: usize,
@@ -541,6 +554,82 @@ mod tests {
         version_header: None,
         user_defined_metadata_prefix: Some("x-test-meta-"),
     };
+
+    #[derive(Debug)]
+    struct CleanEofClient {
+        requests: AtomicUsize,
+        retry: RetryConfig,
+    }
+
+    #[async_trait]
+    impl GetClient for CleanEofClient {
+        const STORE: &'static str = "clean EOF";
+        const HEADER_CONFIG: HeaderConfig = CFG;
+
+        fn retry_config(&self) -> &RetryConfig {
+            &self.retry
+        }
+
+        async fn get_request(
+            &self,
+            _ctx: &mut RetryContext,
+            _path: &Path,
+            options: GetOptions,
+        ) -> Result<HttpResponse> {
+            let request = self.requests.fetch_add(1, Ordering::Relaxed);
+            let response = match request {
+                0 => {
+                    assert!(options.range.is_none());
+                    http::Response::builder()
+                        .header(CONTENT_LENGTH, 10)
+                        .header(http::header::ETAG, "\"abc\"")
+                        .body(HttpResponseBody::from(Bytes::from_static(b"hello")))
+                        .unwrap()
+                }
+                1 => {
+                    assert_eq!(options.range, Some(GetRange::Bounded(5..10)));
+                    assert_eq!(
+                        options
+                            .extensions
+                            .get::<IfRange>()
+                            .map(|value| value.0.as_str()),
+                        Some("\"abc\"")
+                    );
+                    http::Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(CONTENT_LENGTH, 5)
+                        .header(CONTENT_RANGE, "bytes 5-9/10")
+                        .header(http::header::ETAG, "\"abc\"")
+                        .body(HttpResponseBody::from(Bytes::from_static(b"world")))
+                        .unwrap()
+                }
+                _ => panic!("unexpected clean-EOF retry request {request}"),
+            };
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_a_clean_eof_before_the_declared_body_length() {
+        let client = Arc::new(CleanEofClient {
+            requests: AtomicUsize::new(0),
+            retry: RetryConfig {
+                max_retries: 3,
+                ..Default::default()
+            },
+        });
+
+        let result = client
+            .get_opts(&Path::from("test"), GetOptions::default())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        assert_eq!(result.as_ref(), b"helloworld");
+        assert_eq!(client.requests.load(Ordering::Relaxed), 2);
+    }
 
     #[tokio::test]
     async fn test_get_range_meta() {
