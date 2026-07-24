@@ -28,11 +28,13 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: debian:bookworm-slim
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ld.lld
     steps:
       - name: Install transport tools
         run: |
           apt-get update
-          apt-get install --yes --no-install-recommends ca-certificates curl git
+          apt-get install --yes --no-install-recommends ca-certificates curl git libc6-dev lld
           rm -rf /var/lib/apt/lists/*
       - uses: actions/checkout@v6
       - name: Install Rust 1.85 and wasm32
@@ -50,5 +52,6 @@ jobs:
               exit 1
             fi
           done
+          command -v ld.lld
       - name: Check browser graph
         run: tests/wasm-consumer/check-wasm-graph.sh
