@@ -15,15 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(feature = "tokio")]
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 use std::task::{Context, Poll};
 
-#[cfg(feature = "tokio")]
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 use crate::PutPayloadMut;
 use crate::{PutPayload, PutResult, Result};
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
-#[cfg(feature = "tokio")]
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 use tokio::task::JoinSet;
 
 /// An upload part request
@@ -118,7 +127,10 @@ impl<W: MultipartUpload + ?Sized> MultipartUpload for Box<W> {
 /// [`Sink`] this back pressure is optional, allowing integration with synchronous producers
 ///
 /// [`Sink`]: futures_util::sink::Sink
-#[cfg(feature = "tokio")]
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 #[derive(Debug)]
 pub struct WriteMultipart {
     upload: Box<dyn MultipartUpload>,
@@ -130,7 +142,10 @@ pub struct WriteMultipart {
     tasks: JoinSet<Result<()>>,
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 impl WriteMultipart {
     /// Create a new [`WriteMultipart`] that will upload using 5MB chunks
     pub fn new(upload: Box<dyn MultipartUpload>) -> Self {

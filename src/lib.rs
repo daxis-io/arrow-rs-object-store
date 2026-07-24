@@ -541,16 +541,22 @@
 pub mod aws;
 #[cfg(feature = "azure")]
 pub mod azure;
-#[cfg(feature = "tokio")]
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 pub mod buffered;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod chunked;
 pub mod delimited;
 #[cfg(feature = "gcp")]
 pub mod gcp;
-#[cfg(feature = "http")]
+#[cfg(any(feature = "http", feature = "http-base"))]
 pub mod http;
-#[cfg(feature = "tokio")]
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 pub mod limit;
 #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 pub mod local;
@@ -560,13 +566,16 @@ pub mod prefix;
 pub mod registry;
 #[cfg(feature = "cloud")]
 pub mod signer;
-#[cfg(feature = "tokio")]
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 pub mod throttle;
 
-#[cfg(feature = "cloud")]
+#[cfg(any(feature = "cloud", feature = "http-base"))]
 pub mod client;
 
-#[cfg(feature = "cloud")]
+#[cfg(any(feature = "cloud", feature = "http-base"))]
 pub use client::{
     ClientConfigKey, ClientOptions, CredentialProvider, StaticCredentialProvider,
     backoff::BackoffConfig, retry::RetryConfig,
@@ -575,7 +584,7 @@ pub use client::{
 #[cfg(all(feature = "cloud", not(target_arch = "wasm32")))]
 pub use client::Certificate;
 
-#[cfg(feature = "cloud")]
+#[cfg(any(feature = "cloud", feature = "http-base"))]
 mod config;
 
 mod tags;
@@ -2046,7 +2055,10 @@ pub enum Error {
     },
 
     /// Error when `tokio::spawn` failed
-    #[cfg(feature = "tokio")]
+    #[cfg(all(
+        feature = "tokio",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[error("Error joining spawned task: {}", source)]
     JoinError {
         /// The wrapped error

@@ -16,13 +16,30 @@
 // under the License.
 
 use crate::ClientOptions;
+#[cfg(all(
+    feature = "reqwest",
+    any(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        feature = "web"
+    )
+))]
+use crate::client::HttpResponseBody;
 use crate::client::builder::{HttpRequestBuilder, RequestBuilderError};
-use crate::client::{HttpRequest, HttpResponse, HttpResponseBody};
+use crate::client::{HttpRequest, HttpResponse};
 use async_trait::async_trait;
 use http::{Method, Uri};
+#[cfg(all(
+    feature = "reqwest",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 use http_body_util::BodyExt;
 use std::error::Error;
 use std::sync::Arc;
+#[cfg(all(
+    feature = "reqwest",
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 use tokio::runtime::Handle;
 
 /// An HTTP protocol error
@@ -83,6 +100,7 @@ impl HttpError {
         }
     }
 
+    #[cfg(feature = "reqwest")]
     pub(crate) fn reqwest(e: reqwest::Error) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         let is_connect = || e.is_connect();
@@ -103,6 +121,10 @@ impl HttpError {
         let mut source = e.source();
         while kind == HttpErrorKind::Unknown {
             if let Some(e) = source {
+                #[cfg(all(
+                    feature = "hyper",
+                    not(all(target_arch = "wasm32", target_os = "unknown"))
+                ))]
                 if let Some(e) = e.downcast_ref::<hyper::Error>() {
                     if e.is_closed() || e.is_incomplete_message() || e.is_body_write_aborted() {
                         kind = HttpErrorKind::Request;
@@ -135,6 +157,13 @@ impl HttpError {
     /// Returns the [`HttpErrorKind`]
     pub fn kind(&self) -> HttpErrorKind {
         self.kind
+    }
+
+    pub(crate) fn has_source<E>(&self) -> bool
+    where
+        E: Error + 'static,
+    {
+        self.source.downcast_ref::<E>().is_some()
     }
 }
 
@@ -208,7 +237,10 @@ impl HttpClient {
 }
 
 #[async_trait]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "reqwest",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 impl HttpService for reqwest::Client {
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         let (parts, body) = req.into_parts();
@@ -228,7 +260,12 @@ impl HttpService for reqwest::Client {
 }
 
 #[async_trait]
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(
+    feature = "reqwest",
+    feature = "web",
+    target_arch = "wasm32",
+    target_os = "unknown"
+))]
 impl HttpService for reqwest::Client {
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         use futures_channel::{mpsc, oneshot};
@@ -270,7 +307,7 @@ impl HttpService for reqwest::Client {
 
         let parts = rx_parts.await.unwrap()?;
         let safe_stream = rx.map(|chunk| {
-            let frame = hyper::body::Frame::data(chunk?);
+            let frame = http_body::Frame::data(chunk?);
             Ok(frame)
         });
         let body = HttpResponseBody::new(StreamBody::new(safe_stream));
@@ -288,10 +325,24 @@ pub trait HttpConnector: std::fmt::Debug + Send + Sync + 'static {
 /// [`HttpConnector`] using [`reqwest::Client`]
 #[derive(Debug, Default)]
 #[allow(missing_copy_implementations)]
-#[cfg(not(all(target_arch = "wasm32", target_os = "wasi")))]
+#[cfg(all(
+    feature = "reqwest",
+    not(all(target_arch = "wasm32", target_os = "wasi")),
+    any(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        feature = "web"
+    )
+))]
 pub struct ReqwestConnector {}
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "wasi")))]
+#[cfg(all(
+    feature = "reqwest",
+    not(all(target_arch = "wasm32", target_os = "wasi")),
+    any(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        feature = "web"
+    )
+))]
 impl HttpConnector for ReqwestConnector {
     fn connect(&self, options: &ClientOptions) -> crate::Result<HttpClient> {
         let client = options.client()?;
@@ -336,12 +387,20 @@ impl HttpConnector for ReqwestConnector {
 /// ```
 #[derive(Debug)]
 #[allow(missing_copy_implementations)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "reqwest",
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 pub struct SpawnedReqwestConnector {
     runtime: Handle,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "reqwest",
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 impl SpawnedReqwestConnector {
     /// Create a new [`SpawnedReqwestConnector`] with the provided [`Handle`] to
     /// a tokio [`Runtime`]
@@ -352,7 +411,11 @@ impl SpawnedReqwestConnector {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "reqwest",
+    feature = "tokio",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 impl HttpConnector for SpawnedReqwestConnector {
     fn connect(&self, options: &ClientOptions) -> crate::Result<HttpClient> {
         let spawn_service = super::SpawnService::new(options.client()?, self.runtime.clone());
@@ -360,21 +423,35 @@ impl HttpConnector for SpawnedReqwestConnector {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+#[cfg(not(all(
+    feature = "reqwest",
+    not(all(target_arch = "wasm32", target_os = "wasi")),
+    any(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        feature = "web"
+    )
+)))]
 pub(crate) fn http_connector(
     custom: Option<Arc<dyn HttpConnector>>,
 ) -> crate::Result<Arc<dyn HttpConnector>> {
     match custom {
         Some(x) => Ok(x),
         None => Err(crate::Error::NotSupported {
-            source: "WASI architectures must provide an HTTPConnector"
+            source: "this HTTP profile must provide an HttpConnector or enable the built-in reqwest host capability"
                 .to_string()
                 .into(),
         }),
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "wasi")))]
+#[cfg(all(
+    feature = "reqwest",
+    not(all(target_arch = "wasm32", target_os = "wasi")),
+    any(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        feature = "web"
+    )
+))]
 pub(crate) fn http_connector(
     custom: Option<Arc<dyn HttpConnector>>,
 ) -> crate::Result<Arc<dyn HttpConnector>> {

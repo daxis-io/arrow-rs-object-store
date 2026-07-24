@@ -28,12 +28,12 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use http::StatusCode;
+use http::header::ToStrError;
 use http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_RANGE,
     CONTENT_TYPE,
 };
 use http_body_util::BodyExt;
-use reqwest::header::ToStrError;
 use std::ops::Range;
 use std::sync::Arc;
 use tracing::info;
@@ -222,7 +222,7 @@ impl<T: GetClient> GetContext<T> {
                                 sleep.as_secs_f32()
                             );
 
-                            tokio::time::sleep(sleep).await;
+                            ctx.retry_ctx.sleep(sleep).await.map_err(Self::err)?;
 
                             let options = GetOptions {
                                 range: Some(GetRange::Bounded(range.clone())),
