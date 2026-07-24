@@ -30,6 +30,7 @@ jobs:
       image: debian:bookworm-slim
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ${{ github.workspace }}/ci/compiler-free-linker.sh
+      RUSTUP_TOOLCHAIN: 1.85.0
     steps:
       - name: Install transport tools
         run: |
@@ -41,7 +42,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
             sh -s -- -y --profile minimal --default-toolchain 1.85.0
-          "$HOME/.cargo/bin/rustup" target add wasm32-unknown-unknown
+          "$HOME/.cargo/bin/rustup" target add --toolchain 1.85.0 wasm32-unknown-unknown
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Verify minimal toolchain
         run: |
