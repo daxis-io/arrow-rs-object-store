@@ -129,7 +129,7 @@ webpki-root-certs = "1"
 reqwest = { version = "0.13", default-features = false, features = ["gzip"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
-wasm-bindgen-test = "0.3.50"
+wasm-bindgen-test = "=0.3.64"
 
 [dev-dependencies.getrandom_v04]
 package = "getrandom"

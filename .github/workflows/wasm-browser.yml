@@ -35,7 +35,7 @@ jobs:
       - name: Install transport tools
         run: |
           apt-get update
-          apt-get install --yes --no-install-recommends ca-certificates curl git libc6-dev libgcc-12-dev lld
+          apt-get install --yes --no-install-recommends ca-certificates curl git libc6-dev libgcc-12-dev lld nodejs
           rm -rf /var/lib/apt/lists/*
       - uses: actions/checkout@v6
       - name: Install Rust 1.85 and wasm32
@@ -44,6 +44,8 @@ jobs:
             sh -s -- -y --profile minimal --default-toolchain 1.85.0
           "$HOME/.cargo/bin/rustup" target add --toolchain 1.85.0 wasm32-unknown-unknown
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install wasm-bindgen test runner
+        run: cargo install --locked wasm-bindgen-cli --version 0.2.114
       - name: Verify minimal toolchain
         run: |
           test -z "${RUSTFLAGS:-}"
@@ -57,3 +59,14 @@ jobs:
           test -x "$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
       - name: Check browser graph
         run: tests/wasm-consumer/check-wasm-graph.sh
+      - name: Exercise a real HTTP consumer
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: |
+          cargo generate-lockfile
+          cargo test \
+            --test http \
+            --target wasm32-unknown-unknown \
+            --no-default-features \
+            --features http-base,reqwest,web \
+            --locked
