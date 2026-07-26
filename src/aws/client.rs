@@ -1051,16 +1051,16 @@ fn encode_path(path: &Path) -> PercentEncode<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GetOptions;
     use crate::ObjectStore;
     use crate::aws::{AmazonS3, AmazonS3Builder};
     use crate::client::HttpClient;
     use crate::client::get::GetClient;
     use crate::client::mock_server::MockServer;
     use crate::client::retry::RetryContext;
+    use crate::{GetOptions, GetRange};
     use futures_util::{StreamExt, TryStreamExt};
     use http::Response;
-    use http::header::{AUTHORIZATION, CONTENT_LENGTH};
+    use http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
     use hyper::Request;
     use hyper::body::Incoming;
 
@@ -1240,6 +1240,41 @@ mod tests {
             .with_disable_bulk_delete(disable_bulk_delete)
             .build()
             .unwrap()
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn test_range_rejects_s3_200_response() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|request| {
+            assert_eq!(request.headers().get(RANGE).unwrap(), "bytes=5-9");
+            Response::builder()
+                .status(200)
+                .header(CONTENT_LENGTH, 5)
+                .header(CONTENT_RANGE, "bytes 5-9/10")
+                .header(ETAG, "\"test-etag\"")
+                .body("world".to_string())
+                .unwrap()
+        });
+
+        let store = make_store(&mock, false, false);
+        let error = store
+            .get_opts(
+                &Path::from("test"),
+                GetOptions {
+                    range: Some(GetRange::Bounded(5..10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Received non-partial response when range requested"),
+            "unexpected error: {error}"
+        );
+        mock.shutdown().await;
     }
 
     #[tokio::test]
