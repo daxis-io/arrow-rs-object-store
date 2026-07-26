@@ -83,7 +83,7 @@ jobs:
           node ci/wasm-http-test-server.mjs > /tmp/wasm-http-test-server.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid"' EXIT
-          for attempt in 1 2 3 4 5; do
+          for _attempt in 1 2 3 4 5; do
             if curl --fail --silent http://127.0.0.1:18080/health; then
               break
             fi
