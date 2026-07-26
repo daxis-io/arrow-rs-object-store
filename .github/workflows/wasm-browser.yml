@@ -44,8 +44,6 @@ jobs:
             sh -s -- -y --profile minimal --default-toolchain 1.85.0
           "$HOME/.cargo/bin/rustup" target add --toolchain 1.85.0 wasm32-unknown-unknown
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Install wasm-bindgen test runner
-        run: cargo install --locked wasm-bindgen-cli --version 0.2.114
       - name: Verify minimal toolchain
         run: |
           test -z "${RUSTFLAGS:-}"
@@ -59,14 +57,34 @@ jobs:
           test -x "$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
       - name: Check browser graph
         run: tests/wasm-consumer/check-wasm-graph.sh
-      - name: Exercise a real HTTP consumer
-        env:
-          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+      - name: Compile the real HTTP consumer
         run: |
           cargo generate-lockfile
-          cargo test \
-            --test http \
-            --target wasm32-unknown-unknown \
-            --no-default-features \
-            --features http-base,reqwest,web \
-            --locked
+          cargo check --locked --test http --target wasm32-unknown-unknown \
+            --no-default-features --features http-base,reqwest,web
+
+  browser-protocol:
+    name: Chrome and Firefox protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install WASM target and browser test runner
+        run: |
+          rustup target add wasm32-unknown-unknown
+          curl --proto '=https' --tlsv1.2 -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh |
+            sh
+      - name: Exercise Fetch and browser retry
+        run: |
+          node ci/wasm-http-test-server.mjs > /tmp/wasm-http-test-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in 1 2 3 4 5; do
+            if curl --fail --silent http://127.0.0.1:18080/health; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18080/health
+          cargo generate-lockfile --manifest-path tests/wasm-consumer/Cargo.toml
+          wasm-pack test --headless --chrome --firefox tests/wasm-consumer --locked --test http \
+            --no-default-features --features http-base,reqwest,web
