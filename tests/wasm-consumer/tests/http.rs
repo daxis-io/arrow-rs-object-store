@@ -16,7 +16,7 @@
 // under the License.
 
 use object_store::{
-    BackoffConfig, ClientOptions, GetOptions, GetRange, ObjectStore, RetryConfig,
+    BackoffConfig, ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, RetryConfig,
     http::HttpBuilder, path::Path,
 };
 use std::time::Duration;
@@ -34,7 +34,7 @@ fn browser_retry() -> RetryConfig {
             base: 1.,
         },
         max_retries: 2,
-        retry_timeout: Duration::from_secs(5),
+        retry_timeout: Duration::from_secs(30),
     }
 }
 
@@ -59,4 +59,45 @@ async fn retries_a_transient_fetch_after_a_nonzero_browser_delay() {
         .unwrap();
 
     assert_eq!(bytes.as_ref(), b"hello");
+}
+
+#[wasm_bindgen_test]
+async fn resumes_a_truncated_fetch_with_if_range() {
+    let store = HttpBuilder::new()
+        .with_url(TEST_URL)
+        .with_client_options(ClientOptions::new().with_allow_http(true))
+        .with_retry(browser_retry())
+        .build()
+        .unwrap();
+
+    let result = store.get(&Path::from("truncated")).await.unwrap();
+    assert_eq!(result.meta.e_tag.as_deref(), Some("\"v1\""));
+    let bytes = result.bytes().await.unwrap();
+
+    assert_eq!(bytes.as_ref(), b"helloworld");
+}
+
+#[wasm_bindgen_test]
+async fn rejects_a_200_response_to_an_if_range_retry() {
+    let store = HttpBuilder::new()
+        .with_url(TEST_URL)
+        .with_client_options(ClientOptions::new().with_allow_http(true))
+        .with_retry(browser_retry())
+        .build()
+        .unwrap();
+
+    let error = store
+        .get(&Path::from("retry-200"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Range request not supported by retry-200"),
+        "unexpected retry error: {error}"
+    );
 }

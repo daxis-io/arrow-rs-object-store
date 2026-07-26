@@ -43,7 +43,11 @@ const server = http.createServer((request, response) => {
     return;
   }
 
-  if (request.url !== "/transient") {
+  if (
+    request.url !== "/transient" &&
+    request.url !== "/truncated" &&
+    request.url !== "/retry-200"
+  ) {
     response.writeHead(404, { ...cors, "Content-Length": "0" });
     response.end();
     return;
@@ -52,26 +56,73 @@ const server = http.createServer((request, response) => {
   const attempt = (attempts.get(request.url) ?? 0) + 1;
   attempts.set(request.url, attempt);
 
-  if (attempt === 1) {
+  if (request.url === "/transient" && attempt === 1) {
     response.writeHead(503, { ...cors, "Content-Length": "0" });
     response.end();
     return;
   }
 
-  if (request.headers.range !== "bytes=0-4") {
+  if (request.url === "/transient") {
+    if (request.headers.range !== "bytes=0-4") {
+      response.writeHead(416, { ...cors, "Content-Length": "0" });
+      response.end();
+      return;
+    }
+
+    attempts.set(request.url, 0);
+    response.writeHead(206, {
+      ...cors,
+      "Content-Length": "5",
+      "Content-Range": "bytes 0-4/5",
+      ETag: '"v1"',
+    });
+    response.end("hello");
+    return;
+  }
+
+  if (attempt === 1) {
+    if (request.headers.range !== undefined) {
+      response.writeHead(416, { ...cors, "Content-Length": "0" });
+      response.end();
+      return;
+    }
+
+    response.writeHead(200, {
+      ...cors,
+      "Content-Length": "10",
+      ETag: '"v1"',
+    });
+    response.end("hello");
+    return;
+  }
+
+  if (
+    request.headers.range !== "bytes=5-9" ||
+    request.headers["if-range"] !== '"v1"'
+  ) {
     response.writeHead(416, { ...cors, "Content-Length": "0" });
     response.end();
     return;
   }
 
   attempts.set(request.url, 0);
+  if (request.url === "/retry-200") {
+    response.writeHead(200, {
+      ...cors,
+      "Content-Length": "10",
+      ETag: '"v1"',
+    });
+    response.end("helloworld");
+    return;
+  }
+
   response.writeHead(206, {
     ...cors,
     "Content-Length": "5",
-    "Content-Range": "bytes 0-4/5",
+    "Content-Range": "bytes 5-9/10",
     ETag: '"v1"',
   });
-  response.end("hello");
+  response.end("world");
 });
 
 server.listen(18080, "127.0.0.1", () => {
