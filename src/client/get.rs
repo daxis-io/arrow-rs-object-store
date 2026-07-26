@@ -225,6 +225,9 @@ impl<T: GetClient> GetContext<T> {
         etag: Option<String>,
         range: Range<u64>,
     ) -> BoxStream<'static, Result<Bytes>> {
+        // A partial response can only be safely combined with bytes already delivered when the
+        // representation is protected by a strong validator (RFC 9110 section 8.8.3).
+        let etag = etag.filter(|etag| is_strong_etag(etag));
         futures_util::stream::try_unfold(
             (self, body, etag, range),
             |(mut ctx, mut body, etag, mut range)| async move {
@@ -439,8 +442,14 @@ pub(crate) fn validate_identity_encoding(headers: &http::HeaderMap) -> Result<()
 }
 
 fn is_strong_etag(etag: &str) -> bool {
-    let etag = etag.trim();
-    etag.starts_with('"') && etag.ends_with('"') && !etag.starts_with("W/")
+    let bytes = etag.trim().as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') {
+        return false;
+    }
+
+    bytes[1..bytes.len() - 1]
+        .iter()
+        .all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte) || *byte >= 0x80)
 }
 
 /// Extracts the [CONTENT_RANGE] header
@@ -562,6 +571,13 @@ mod tests {
         retry: RetryConfig,
     }
 
+    #[derive(Debug)]
+    struct NonStrongEofClient {
+        requests: AtomicUsize,
+        retry: RetryConfig,
+        etag: Option<&'static str>,
+    }
+
     #[async_trait]
     impl GetClient for CleanEofClient {
         const STORE: &'static str = "clean EOF";
@@ -610,6 +626,38 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl GetClient for NonStrongEofClient {
+        const STORE: &'static str = "non-strong EOF";
+        const HEADER_CONFIG: HeaderConfig = CFG;
+
+        fn retry_config(&self) -> &RetryConfig {
+            &self.retry
+        }
+
+        async fn get_request(
+            &self,
+            _ctx: &mut RetryContext,
+            _path: &Path,
+            options: GetOptions,
+        ) -> Result<HttpResponse> {
+            let request = self.requests.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(
+                request, 0,
+                "a truncated body without a strong ETag must not be retried"
+            );
+            assert!(options.range.is_none());
+
+            let mut response = http::Response::builder().header(CONTENT_LENGTH, 10);
+            if let Some(etag) = self.etag {
+                response = response.header(http::header::ETAG, etag);
+            }
+            Ok(response
+                .body(HttpResponseBody::from(Bytes::from_static(b"hello")))
+                .unwrap())
+        }
+    }
+
     #[tokio::test]
     async fn retries_a_clean_eof_before_the_declared_body_length() {
         let client = Arc::new(CleanEofClient {
@@ -630,6 +678,52 @@ mod tests {
 
         assert_eq!(result.as_ref(), b"helloworld");
         assert_eq!(client.requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn truncated_body_is_not_retried_without_a_valid_strong_etag() {
+        for etag in [
+            None,
+            Some("W/\"abc\""),
+            Some("abc"),
+            Some("\"abc\",\"other\""),
+        ] {
+            let client = Arc::new(NonStrongEofClient {
+                requests: AtomicUsize::new(0),
+                retry: RetryConfig {
+                    max_retries: 3,
+                    ..Default::default()
+                },
+                etag,
+            });
+
+            let error = client
+                .get_opts(&Path::from("test"), GetOptions::default())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("Response body ended at byte 5, expected byte 10"),
+                "unexpected error for ETag {etag:?}: {error}"
+            );
+            assert_eq!(client.requests.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn strong_etag_validation_follows_entity_tag_grammar() {
+        assert!(is_strong_etag("\"\""));
+        assert!(is_strong_etag("\"abc\""));
+        assert!(!is_strong_etag("W/\"abc\""));
+        assert!(!is_strong_etag("abc"));
+        assert!(!is_strong_etag("\"abc"));
+        assert!(!is_strong_etag("\"abc\",\"other\""));
+        assert!(!is_strong_etag("\"abc def\""));
     }
 
     #[tokio::test]
@@ -866,7 +960,7 @@ mod http_tests {
             mock.push(
                 Response::builder()
                     .header(CONTENT_LENGTH, 12)
-                    .header(ETAG, "123")
+                    .header(ETAG, "\"123\"")
                     // connection: close disables keep alive
                     .header(CONNECTION, "close")
                     .body("Hello".to_string())
@@ -882,7 +976,7 @@ mod http_tests {
                 Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(CONTENT_LENGTH, 7)
-                    .header(ETAG, "123")
+                    .header(ETAG, "\"123\"")
                     .header(CONTENT_RANGE, "bytes 5-11/12")
                     .body(" World!".to_string())
                     .unwrap()
@@ -897,7 +991,7 @@ mod http_tests {
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(CONTENT_LENGTH, 5)
                     .header(CONNECTION, "close")
-                    .header(ETAG, "123")
+                    .header(ETAG, "\"123\"")
                     .header(CONTENT_RANGE, "bytes 6-10/12")
                     .body("Wo".to_string())
                     .unwrap(),
@@ -912,7 +1006,7 @@ mod http_tests {
                 Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(CONTENT_LENGTH, 3)
-                    .header(ETAG, "123")
+                    .header(ETAG, "\"123\"")
                     .header(CONTENT_RANGE, "bytes 8-10/12")
                     .body("rld".to_string())
                     .unwrap()
@@ -926,7 +1020,7 @@ mod http_tests {
         mock.push(
             Response::builder()
                 .header(CONTENT_LENGTH, 10)
-                .header(ETAG, "123")
+                .header(ETAG, "\"123\"")
                 .body(Chunked::new(vec![
                     Ok(Bytes::from_static(b"banana")),
                     Err(()),
@@ -943,7 +1037,7 @@ mod http_tests {
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(CONTENT_LENGTH, 4)
-                .header(ETAG, "123")
+                .header(ETAG, "\"123\"")
                 .header(CONTENT_RANGE, "bytes 6-9/10")
                 .body("1234".to_string())
                 .unwrap()
@@ -956,7 +1050,7 @@ mod http_tests {
         mock.push(
             Response::builder()
                 .header(CONTENT_LENGTH, 20)
-                .header(ETAG, "foo")
+                .header(ETAG, "\"foo\"")
                 .body(Chunked::new(vec![
                     Ok(Bytes::from_static(b"hello")),
                     Err(()),
@@ -973,7 +1067,7 @@ mod http_tests {
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(CONTENT_LENGTH, 15)
-                .header(ETAG, "foo")
+                .header(ETAG, "\"foo\"")
                 .header(CONTENT_RANGE, "bytes 5-19/20")
                 .body(Chunked::new(vec![Ok(Bytes::from_static(b"baz")), Err(())]))
                 .unwrap()
@@ -999,7 +1093,7 @@ mod http_tests {
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(CONTENT_LENGTH, 12)
-                .header(ETAG, "foo")
+                .header(ETAG, "\"foo\"")
                 .header(CONTENT_RANGE, "bytes 8-19/20")
                 .body("123456789012".to_string())
                 .unwrap()
@@ -1012,7 +1106,7 @@ mod http_tests {
         mock.push(
             Response::builder()
                 .header(CONTENT_LENGTH, 12)
-                .header(ETAG, "foo")
+                .header(ETAG, "\"foo\"")
                 .body(Chunked::new(vec![Ok(Bytes::from_static(b"test")), Err(())]))
                 .unwrap(),
         );
@@ -1026,17 +1120,17 @@ mod http_tests {
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(CONTENT_LENGTH, 7)
-                .header(ETAG, "baz")
+                .header(ETAG, "\"baz\"")
                 .header(CONTENT_RANGE, "bytes 4-11/12")
                 .body("1234567".to_string())
                 .unwrap()
         });
 
         let err = store.get(&path).await.unwrap().bytes().await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "Generic HTTP error: HTTP error: request or response body error"
-        );
+        let message = err.to_string();
+        assert!(message.contains("did not honor If-Range"), "{message}");
+        assert!(message.contains("\"foo\""), "{message}");
+        assert!(message.contains("baz"), "{message}");
     }
     #[tokio::test]
     async fn test_retry_validates_content_range_and_sends_if_range() {
