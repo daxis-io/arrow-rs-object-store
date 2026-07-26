@@ -32,3 +32,6 @@ http = ["object_store/http"]
 
 [dependencies]
 object_store = { path = "../..", default-features = false }
+
+[dev-dependencies]
+wasm-bindgen-test = "=0.3.64"
