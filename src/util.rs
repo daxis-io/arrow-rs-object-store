@@ -25,11 +25,11 @@ use super::Result;
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt, stream::StreamExt};
 
-#[cfg(any(feature = "azure", feature = "http"))]
+#[cfg(any(feature = "azure", feature = "http", feature = "http-base"))]
 pub(crate) static RFC1123_FMT: &str = "%a, %d %h %Y %T GMT";
 
 // deserialize dates according to rfc1123
-#[cfg(any(feature = "azure", feature = "http"))]
+#[cfg(any(feature = "azure", feature = "http", feature = "http-base"))]
 pub(crate) fn deserialize_rfc1123<'de, D>(
     deserializer: D,
 ) -> Result<chrono::DateTime<chrono::Utc>, D::Error>

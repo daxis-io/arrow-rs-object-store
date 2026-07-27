@@ -21,6 +21,8 @@ use http::uri::InvalidUri;
 use http::{HeaderName, HeaderValue, Method, Uri};
 
 #[derive(Debug, thiserror::Error)]
+// Host-neutral feature profiles compile only the three `Invalid*` variants.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum RequestBuilderError {
     #[error("Invalid URI")]
     InvalidUri(#[from] InvalidUri),
@@ -31,9 +33,11 @@ pub(crate) enum RequestBuilderError {
     #[error("Invalid Header Name")]
     InvalidHeaderName(#[from] InvalidHeaderName),
 
+    #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
     #[error("JSON serialization error")]
     SerdeJson(#[from] serde_json::Error),
 
+    #[cfg(any(test, feature = "aws", feature = "gcp", feature = "azure"))]
     #[error("URL serialization error")]
     SerdeUrl(#[from] serde_urlencoded::ser::Error),
 }
