@@ -166,6 +166,9 @@ pub(crate) enum GetResultError {
         actual: Range<u64>,
     },
 
+    #[error("Retry response changed object size from {expected} to {actual}")]
+    UnexpectedObjectSize { expected: u64, actual: u64 },
+
     #[error("Range response used unsupported Content-Encoding \"{encoding}\"; expected identity")]
     EncodedRange { encoding: String },
 
@@ -208,7 +211,7 @@ impl<T: GetClient> GetContext<T> {
         .map_err(Self::err)?;
 
         let attributes = get_attributes(T::HEADER_CONFIG, &parts.headers).map_err(Self::err)?;
-        let stream = self.retry_stream(body, meta.e_tag.clone(), range.clone());
+        let stream = self.retry_stream(body, meta.e_tag.clone(), range.clone(), meta.size);
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream),
@@ -223,13 +226,14 @@ impl<T: GetClient> GetContext<T> {
         body: HttpResponseBody,
         etag: Option<String>,
         range: Range<u64>,
+        object_size: u64,
     ) -> BoxStream<'static, Result<Bytes>> {
         // A partial response can only be safely combined with bytes already delivered when the
         // representation is protected by a strong validator (RFC 9110 section 8.8.3).
         let etag = etag.filter(|etag| is_strong_etag(etag));
         futures_util::stream::try_unfold(
-            (self, body, etag, range),
-            |(mut ctx, mut body, etag, mut range)| async move {
+            (self, body, etag, range, object_size),
+            |(mut ctx, mut body, etag, mut range, object_size)| async move {
                 loop {
                     let ret = match body.frame().await {
                         Some(ret) => ret,
@@ -267,7 +271,7 @@ impl<T: GetClient> GetContext<T> {
                                     }));
                                 }
                                 range.start = next;
-                                return Ok(Some((bytes, (ctx, body, etag, range))));
+                                return Ok(Some((bytes, (ctx, body, etag, range, object_size))));
                             }
                             Err(_) => continue, // Isn't data frame
                         },
@@ -298,6 +302,10 @@ impl<T: GetClient> GetContext<T> {
                                 .map_err(Self::err)?;
 
                             let (parts, retry_body) = request.into_parts();
+                            if parts.status != StatusCode::PARTIAL_CONTENT {
+                                return Err(Self::err(GetResultError::NotPartial));
+                            }
+
                             let retry_etag = get_etag(&parts.headers).map_err(Self::err)?;
 
                             if etag != &retry_etag {
@@ -307,52 +315,21 @@ impl<T: GetClient> GetContext<T> {
 
                             let content_range =
                                 validate_range_response(&parts.headers).map_err(Self::err)?;
+                            if content_range.size != object_size {
+                                return Err(Self::err(GetResultError::UnexpectedObjectSize {
+                                    expected: object_size,
+                                    actual: content_range.size,
+                                }));
+                            }
                             let actual = content_range.range;
 
-                            if actual == range {
-                                body = retry_body;
-                            } else if actual.start <= range.start && actual.end >= range.end {
-                                let skip = (range.start - actual.start) as usize;
-                                let mut skipped = 0;
-                                let mut retry_body = retry_body;
-                                while skipped < skip {
-                                    let frame = retry_body
-                                        .frame()
-                                        .await
-                                        .ok_or_else(|| {
-                                            Self::err(GetResultError::UnexpectedRange {
-                                                expected: range.clone(),
-                                                actual: actual.clone(),
-                                            })
-                                        })?
-                                        .map_err(Self::err)?;
-                                    let Some(bytes) = frame.into_data().ok() else {
-                                        continue;
-                                    };
-                                    let remaining = skip - skipped;
-                                    if bytes.len() <= remaining {
-                                        skipped += bytes.len();
-                                    } else {
-                                        let keep = bytes.slice(remaining..);
-                                        let next = range.start + keep.len() as u64;
-                                        if next > range.end {
-                                            return Err(Self::err(GetResultError::BodyTooLong {
-                                                expected: range.end,
-                                            }));
-                                        }
-                                        range.start = next;
-                                        body = retry_body;
-                                        let etag = Some(etag.clone());
-                                        return Ok(Some((keep, (ctx, body, etag, range))));
-                                    }
-                                }
-                                body = retry_body;
-                            } else {
+                            if actual != range {
                                 return Err(Self::err(GetResultError::UnexpectedRange {
                                     expected: range,
                                     actual,
                                 }));
                             }
+                            body = retry_body;
                         }
                         (Err(e), _) => return Err(Self::err(e)),
                     }
@@ -577,6 +554,15 @@ mod tests {
         etag: Option<&'static str>,
     }
 
+    #[derive(Debug)]
+    struct InvalidRetryClient {
+        requests: AtomicUsize,
+        retry: RetryConfig,
+        status: StatusCode,
+        content_range: &'static str,
+        retry_body: &'static [u8],
+    }
+
     #[async_trait]
     impl GetClient for CleanEofClient {
         const STORE: &'static str = "clean EOF";
@@ -657,6 +643,54 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl GetClient for InvalidRetryClient {
+        const STORE: &'static str = "invalid retry";
+        const HEADER_CONFIG: HeaderConfig = CFG;
+
+        fn retry_config(&self) -> &RetryConfig {
+            &self.retry
+        }
+
+        async fn get_request(
+            &self,
+            _ctx: &mut RetryContext,
+            _path: &Path,
+            options: GetOptions,
+        ) -> Result<HttpResponse> {
+            let request = self.requests.fetch_add(1, Ordering::Relaxed);
+            let response = match request {
+                0 => {
+                    assert!(options.range.is_none());
+                    http::Response::builder()
+                        .header(CONTENT_LENGTH, 10)
+                        .header(http::header::ETAG, "\"abc\"")
+                        .body(HttpResponseBody::from(Bytes::from_static(b"hello")))
+                        .unwrap()
+                }
+                1 => {
+                    assert_eq!(options.range, Some(GetRange::Bounded(5..10)));
+                    assert_eq!(
+                        options
+                            .extensions
+                            .get::<IfRange>()
+                            .map(|value| value.0.as_str()),
+                        Some("\"abc\"")
+                    );
+                    http::Response::builder()
+                        .status(self.status)
+                        .header(CONTENT_LENGTH, self.retry_body.len())
+                        .header(CONTENT_RANGE, self.content_range)
+                        .header(http::header::ETAG, "\"abc\"")
+                        .body(HttpResponseBody::from(Bytes::from_static(self.retry_body)))
+                        .unwrap()
+                }
+                _ => panic!("unexpected invalid retry request {request}"),
+            };
+            Ok(response)
+        }
+    }
+
     #[tokio::test]
     async fn retries_a_clean_eof_before_the_declared_body_length() {
         let client = Arc::new(CleanEofClient {
@@ -711,6 +745,87 @@ mod tests {
                 "unexpected error for ETag {etag:?}: {error}"
             );
             assert_eq!(client.requests.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    async fn invalid_retry_stream(
+        status: StatusCode,
+        content_range: &'static str,
+        retry_body: &'static [u8],
+    ) -> BoxStream<'static, Result<Bytes>> {
+        Arc::new(InvalidRetryClient {
+            requests: AtomicUsize::new(0),
+            retry: RetryConfig {
+                max_retries: 3,
+                ..Default::default()
+            },
+            status,
+            content_range,
+            retry_body,
+        })
+        .get_opts(&Path::from("test"), GetOptions::default())
+        .await
+        .unwrap()
+        .into_stream()
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_non_partial_response_before_resumed_bytes() {
+        let mut stream = invalid_retry_stream(StatusCode::OK, "bytes 5-9/10", b"world").await;
+
+        assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"hello");
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Received non-partial response when range requested"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_changed_representation_size_before_resumed_bytes() {
+        let mut stream =
+            invalid_retry_stream(StatusCode::PARTIAL_CONTENT, "bytes 5-9/20", b"world").await;
+
+        assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"hello");
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Retry response changed object size from 10 to 20"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_enclosing_range_before_resumed_bytes() {
+        let mut stream =
+            invalid_retry_stream(StatusCode::PARTIAL_CONTENT, "bytes 4-9/10", b"xworld").await;
+
+        assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"hello");
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("Requested 5..10, got 4..10"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_partial_prefix_or_suffix_before_resumed_bytes() {
+        for (content_range, retry_body, expected) in [
+            ("bytes 5-7/10", b"wor".as_slice(), "got 5..8"),
+            ("bytes 7-9/10", b"rld".as_slice(), "got 7..10"),
+        ] {
+            let mut stream =
+                invalid_retry_stream(StatusCode::PARTIAL_CONTENT, content_range, retry_body).await;
+
+            assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"hello");
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error for {content_range}: {error}"
+            );
         }
     }
 
@@ -1165,12 +1280,15 @@ mod http_tests {
             assert_eq!(req.headers().get(IF_RANGE).unwrap(), "\"abc\"");
             assert_eq!(req.headers().get(ACCEPT_ENCODING).unwrap(), "identity");
 
+            // The continuation must cover exactly the outstanding range. An
+            // enclosing response is rejected instead of trimmed; see
+            // `retry_rejects_enclosing_range_before_resumed_bytes`.
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(CONTENT_LENGTH, 10)
+                .header(CONTENT_LENGTH, 5)
                 .header(ETAG, "\"abc\"")
-                .header(CONTENT_RANGE, "bytes 0-9/10")
-                .body("helloworld".to_string())
+                .header(CONTENT_RANGE, "bytes 5-9/10")
+                .body("world".to_string())
                 .unwrap()
         });
 
