@@ -968,13 +968,13 @@ fn encode_path(path: &Path) -> PercentEncode<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GetOptions;
     use crate::client::HttpClient;
-    use crate::client::get::GetClient;
+    use crate::client::get::{GetClient, GetClientExt};
     use crate::client::mock_server::MockServer;
     use crate::client::retry::RetryContext;
+    use crate::{GetOptions, GetRange};
     use http::Response;
-    use http::header::{AUTHORIZATION, CONTENT_LENGTH};
+    use http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
     use hyper::Request;
     use hyper::body::Incoming;
 
@@ -1135,6 +1135,48 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+        mock.shutdown().await;
+    }
+
+    /// A provider that answers a range request with a full-object `200` must fail
+    /// through the same shared diagnostic as every other store, rather than
+    /// silently handing back bytes the caller never asked for.
+    #[tokio::test]
+    async fn test_range_rejects_s3_200_response() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|request| {
+            assert_eq!(request.headers().get(RANGE).unwrap(), "bytes=5-9");
+            Response::builder()
+                .status(200)
+                .header(CONTENT_LENGTH, 5)
+                .header(CONTENT_RANGE, "bytes 5-9/10")
+                .header(ETAG, "\"test-etag\"")
+                .body("world".to_string())
+                .unwrap()
+        });
+
+        let config = default_headers_config(&mock);
+        let client = Arc::new(S3Client::new(
+            config,
+            HttpClient::new(reqwest::Client::new()),
+        ));
+        let error = client
+            .get_opts(
+                &Path::from("test"),
+                GetOptions {
+                    range: Some(GetRange::Bounded(5..10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Received non-partial response when range requested"),
+            "unexpected error: {error}"
+        );
         mock.shutdown().await;
     }
 }
