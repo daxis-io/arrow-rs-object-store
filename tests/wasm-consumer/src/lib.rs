@@ -15,23 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! HTTP client abstraction
+#[cfg(feature = "http-base")]
+pub fn host_neutral_retry_policy() -> object_store::RetryConfig {
+    object_store::RetryConfig::default()
+}
 
-mod body;
-pub use body::*;
+#[cfg(all(feature = "http-base", feature = "reqwest", feature = "web"))]
+pub fn browser_http_store(url: &str) -> object_store::Result<object_store::http::HttpStore> {
+    let connector = object_store::client::ReqwestConnector::default();
+    object_store::http::HttpBuilder::new()
+        .with_url(url)
+        .with_http_connector(connector)
+        .build()
+}
 
-mod connection;
-pub use connection::*;
-
-#[cfg(all(
-    feature = "reqwest",
-    feature = "tokio",
-    not(all(target_arch = "wasm32", target_os = "unknown"))
-))]
-mod spawn;
-#[cfg(all(
-    feature = "reqwest",
-    feature = "tokio",
-    not(all(target_arch = "wasm32", target_os = "unknown"))
-))]
-pub use spawn::*;
+#[cfg(feature = "http")]
+pub fn batteries_included_http_store(
+    url: &str,
+) -> object_store::Result<object_store::http::HttpStore> {
+    object_store::http::HttpBuilder::new().with_url(url).build()
+}
